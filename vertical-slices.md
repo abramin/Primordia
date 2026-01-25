@@ -1,461 +1,1028 @@
 # Primordia - Vertical Slices
 
-This document breaks down the Primordia game into vertical slices that can be implemented incrementally. Each slice delivers end-to-end functionality across the full stack (Django, Angular, PostgreSQL, Kafka, Celery).
+This document breaks down the Primordia game into vertical slices that can be implemented incrementally. Each slice delivers end-to-end functionality across the full stack (Phoenix, React, PostgreSQL, GenServers).
 
 ---
 
-## Slice 1: User Authentication & Static World View
+## Slice 1: Project Setup & Static World View
 
-**Goal:** Players can register, log in, and see a static game map.
+**Goal:** Set up the Elixir/Phoenix project, create the world, and display a static map.
 
-### Frontend (Angular)
-- Login/registration forms with form validation
-- Authentication service with JWT token management
-- Route guards for protected pages
-- Basic map component displaying a 100x100 grid
-- Render different tile types (Plains, Mountains, Water, Forests) with distinct colors/icons
+### Backend (Phoenix)
 
-### Backend (Django)
-- User model and authentication endpoints (register, login, logout)
-- JWT token generation and validation
-- World generation command to create initial 100x100 tile grid
-- REST API endpoint: `GET /api/world/tiles` (returns all tiles with coordinates and terrain type)
-- Tile model with fields: x, y, terrain_type
+**Project Setup:**
+- Create new Phoenix project: `mix phx.new primordia --database postgres`
+- Configure PostgreSQL connection in `config/dev.exs`
+- Set up CORS for React frontend (add `corsica` plug)
+- Create basic folder structure following Phoenix conventions
 
-### Database (PostgreSQL)
-- Users table
-- Tiles table with spatial indexing on (x, y)
+**Database (Ecto):**
+- Migration: `tiles` table with `x`, `y`, `terrain_type` fields
+- Add composite index on `(x, y)` for spatial queries
+- Seed script to generate 100x100 tile grid with random terrain
 
-### Infrastructure
-- Basic Django project structure
-- Angular project setup with routing
-- CORS configuration
-- Environment configuration for DB connection
+**Modules:**
+```
+lib/primordia/
+├── game/
+│   ├── tile.ex           # Ecto schema
+│   └── world.ex          # Context module for tile queries
+```
+
+**REST API:**
+- `GET /api/tiles` - Returns all tiles (paginated or chunked)
+- TileController with JSON view
+
+### Frontend (React)
+
+**Project Setup:**
+- Create Vite + React + TypeScript project
+- Install dependencies: `phoenix`, `pixi.js`, `zustand`
+- Configure proxy to Phoenix backend
+
+**Components:**
+- `GameMap.tsx` - Pixi.js canvas rendering 100x100 grid
+- `Tile.tsx` - Individual tile sprite with terrain-based coloring
+- Basic color scheme: Plains (green), Mountains (gray), Water (blue), Forest (dark green)
 
 **Acceptance Criteria:**
-- User can register and log in
-- Authenticated user sees a rendered 100x100 map with different terrain types
-- Map is static (no fog of war yet)
+- Phoenix server starts and connects to PostgreSQL
+- Running `mix run priv/repo/seeds.exs` creates 100x100 world
+- React app displays rendered map with different terrain colors
+- No authentication yet - map is publicly visible
 
 ---
 
-## Slice 2: Player State & Initial Settler
+## Slice 2: User Authentication
 
-**Goal:** New players spawn with one Settler unit that they can see on the map.
+**Goal:** Players can register, log in, and receive a token for authenticated requests.
 
-### Frontend (Angular)
-- Unit rendering layer on top of the map
-- Display unit icon at specific coordinates
-- Player resource panel showing Gold, Food, Science (initially zero)
-- Service to fetch current player state
+### Backend (Phoenix)
 
-### Backend (Django)
-- Player model (extends User) with fields: gold, food, science
-- Unit model with fields: unit_type, owner (FK to Player), x, y, movement_speed, health
-- Game initialization: when user first logs in, spawn a Settler at random valid location
-- REST API endpoints:
-  - `GET /api/player/state` (returns player resources and owned units)
-  - `GET /api/units/mine` (returns all units owned by authenticated player)
+**Dependencies:**
+- Add `bcrypt_elixir` for password hashing
+- Add `guardian` for JWT token generation
 
-### Database (PostgreSQL)
-- Players table (gold, food, science, tech_tree_state JSON)
-- Units table with FK to players and position fields
+**Database (Ecto):**
+- Migration: `users` table with `id`, `email`, `username`, `password_hash`
+- Unique constraint on email and username
+
+**Modules:**
+```
+lib/primordia/
+├── accounts/
+│   ├── user.ex           # Ecto schema with password hashing
+│   └── accounts.ex       # Context: register_user, authenticate_user
+lib/primordia_web/
+├── controllers/
+│   ├── auth_controller.ex    # register, login endpoints
+│   └── auth_json.ex          # JSON views
+├── guardian.ex               # Guardian configuration
+└── plugs/
+    └── auth_pipeline.ex      # JWT verification plug
+```
+
+**REST API:**
+- `POST /api/auth/register` - Create account, return token
+- `POST /api/auth/login` - Authenticate, return token
+- `GET /api/auth/me` - Return current user (protected)
+
+### Frontend (React)
+
+**Components:**
+- `LoginForm.tsx` - Email/password form
+- `RegisterForm.tsx` - Registration form
+- `AuthContext.tsx` - Store JWT token, provide auth state
+- Protected route wrapper
+
+**State:**
+- Zustand store for auth: `{ token, user, login(), logout() }`
 
 **Acceptance Criteria:**
-- New player automatically receives one Settler unit at game start
-- Player can see their Settler's position on the map
-- Player resource panel displays current resources (all zero initially)
+- User can register with email/username/password
+- User can log in and receive JWT token
+- Token is stored in localStorage
+- Protected routes redirect to login if not authenticated
 
 ---
 
-## Slice 3: City Founding (Synchronous)
+## Slice 3: Player State & Initial Settler
 
-**Goal:** Player can click their Settler and found a city instantly.
+**Goal:** New players spawn with resources and one Settler unit visible on the map.
 
-### Frontend (Angular)
-- Unit selection: click on Settler to select it
-- Context menu or button: "Found City" action
-- City rendering on map (different from unit icon)
-- Update map when city is founded (Settler disappears, City appears)
+### Backend (Phoenix)
 
-### Backend (Django)
-- City model with fields: name, owner (FK to Player), x, y, population, food_stores, production_queue (JSON)
-- REST API endpoint: `POST /api/cities/found`
-  - Request body: `{ x, y }` (coordinates of settler)
-  - Validation: Check player owns a Settler at those coordinates
-  - Action: Delete Settler unit, create City entity
-  - Response: New city data
-- Business logic: City naming (auto-generate or let player choose)
+**Database (Ecto):**
+- Migration: `players` table with `user_id`, `gold`, `food`, `science`
+- Migration: `units` table with `id`, `player_id`, `unit_type`, `x`, `y`, `health`
+- Player created automatically when user first accesses game
 
-### Database (PostgreSQL)
-- Cities table
+**Modules:**
+```
+lib/primordia/
+├── game/
+│   ├── player.ex         # Ecto schema
+│   ├── unit.ex           # Ecto schema
+│   └── game.ex           # Context: get_or_create_player, spawn_settler
+```
+
+**Logic:**
+- On first game access, create Player record linked to User
+- Spawn Settler at random valid land tile
+- Initial resources: gold=100, food=50, science=0
+
+**REST API:**
+- `GET /api/game/state` - Returns player resources and all owned units
+- `GET /api/units` - Returns player's units with positions
+
+### Frontend (React)
+
+**Components:**
+- `UnitLayer.tsx` - Pixi.js layer rendering units on map
+- `ResourcePanel.tsx` - Display Gold, Food, Science
+- `UnitSprite.tsx` - Settler icon at coordinates
+
+**State:**
+- Zustand game store: `{ player, units, fetchGameState() }`
 
 **Acceptance Criteria:**
-- Player can click on their Settler and select "Found City"
-- Settler is removed from the map
-- City appears at the same location
-- API validates that player owns the Settler before allowing city founding
+- New authenticated player automatically receives Player record
+- Player has one Settler unit at random position
+- Map shows Settler icon at correct coordinates
+- Resource panel displays current resources
 
 ---
 
-## Slice 4: Global Tick - Passive Resource Generation
+## Slice 4: Phoenix Channels & Real-time Connection
 
-**Goal:** Cities automatically generate resources every 10 seconds, even when player is offline.
+**Goal:** Establish WebSocket connection for real-time game updates.
 
-### Frontend (Angular)
-- Auto-refresh player state every 10 seconds via polling or WebSocket
-- Animate resource counter updates
+### Backend (Phoenix)
 
-### Backend (Django)
-- Resource generation logic: each city generates Food, Gold, Science based on tile types in its radius
-- Celery periodic task: `global_tick` runs every 10 seconds
-  - Query all cities
-  - Calculate resource generation for each city
-  - Update player resource totals
-- REST API: Enhanced `GET /api/player/state` reflects updated resources
+**Modules:**
+```
+lib/primordia_web/
+├── channels/
+│   ├── user_socket.ex        # Socket authentication
+│   ├── game_channel.ex       # game:player:{id} topic
+│   └── presence.ex           # Track connected players (optional)
+```
 
-### Infrastructure (Kafka + Celery)
-- Install and configure Kafka
-- Install and configure Celery with Redis/RabbitMQ as broker
-- Celery beat scheduler for periodic tasks
-- Create Celery task: `tasks.global_tick()`
+**Channel Events:**
+- `join` - Authenticate and return current game state
+- `game_state` (outgoing) - Full state pushed on join
 
-### Database (PostgreSQL)
-- Add timestamp fields to Player model: `last_tick_at`
+**Socket Authentication:**
+- Verify JWT token in `connect/3`
+- Store `player_id` in socket assigns
+
+### Frontend (React)
+
+**Services:**
+- `socket.ts` - Phoenix Socket connection with token auth
+- `gameChannel.ts` - Join `game:player:{id}`, handle events
+
+**Hooks:**
+- `useGameChannel()` - Connect on mount, handle events, update store
 
 **Acceptance Criteria:**
-- Every 10 seconds, all cities generate resources
-- Player resource totals increase automatically
-- Resource generation continues even when player is logged out
-- Frontend reflects resource updates in real-time
+- React app connects to Phoenix Channel on game load
+- Connection authenticated with JWT token
+- Server pushes initial game state on join
+- Console logs show successful connection
 
 ---
 
-## Slice 5: Building Production Queue (Asynchronous)
+## Slice 5: City Founding (Synchronous via Channel)
 
-**Goal:** Player can queue a building (e.g., Granary) that takes real-world time to complete.
+**Goal:** Player can found a city using their Settler via Channel message.
 
-### Frontend (Angular)
-- City detail panel showing production queue
-- Building selection menu with available buildings and their costs/durations
-- Display production timer counting down
-- WebSocket listener for building completion events
+### Backend (Phoenix)
 
-### Backend (Django)
-- Building model/enum with types: Granary, Wall, Market (each with production_cost, duration_seconds)
-- REST API endpoint: `POST /api/cities/{city_id}/build`
-  - Request body: `{ building_type }`
-  - Validation: Check city not currently building something, player has resources
-  - Action: Deduct resources, add building to city's production queue, publish event to Kafka
-- Kafka producer: Publish `BuildingStarted` event
-- Celery consumer: Listen for `BuildingStarted` events, schedule delayed task
-- Celery delayed task: `complete_building.apply_async(args=[city_id], countdown=duration_seconds)`
-  - When fires: Update city with completed building, publish `BuildingCompleted` event
+**Database (Ecto):**
+- Migration: `cities` table with `id`, `player_id`, `name`, `x`, `y`, `population`, `food_stores`
 
-### Infrastructure (Kafka)
-- Kafka topic: `game-events`
-- Celery task: `tasks.complete_building(city_id, building_type)`
+**Modules:**
+```
+lib/primordia/
+├── game/
+│   ├── city.ex           # Ecto schema
+│   └── game.ex           # found_city/3 function
+```
 
-### Database (PostgreSQL)
-- Buildings table (or JSON field on City): building_type, started_at, completes_at, completed
+**Channel Events (game_channel.ex):**
+```elixir
+def handle_in("found_city", %{"settler_id" => id, "name" => name}, socket) do
+  case Game.found_city(socket.assigns.player_id, id, name) do
+    {:ok, city} ->
+      broadcast!(socket, "city_founded", CityJSON.show(city))
+      {:reply, {:ok, %{city_id: city.id}}, socket}
+    {:error, reason} ->
+      {:reply, {:error, %{reason: reason}}, socket}
+  end
+end
+```
+
+**Logic:**
+- Validate player owns settler at location
+- Delete settler unit
+- Create city at settler's coordinates
+- Broadcast `city_founded` event
+
+### Frontend (React)
+
+**Components:**
+- `CitySprite.tsx` - City icon rendering
+- Unit selection state - click Settler to select
+- "Found City" button when Settler selected
+- Name input modal
+
+**Channel Integration:**
+- Send `found_city` event with settler_id and name
+- Handle `city_founded` event to update local state
 
 **Acceptance Criteria:**
-- Player can select a city and choose "Build Granary"
-- System validates and deducts resources
-- Building appears in production queue with countdown
-- After the specified duration (e.g., 2 minutes), building completes automatically
-- Building completion applies effects (e.g., Granary increases food generation)
+- Clicking Settler shows "Found City" action
+- Entering name and confirming sends Channel message
+- Settler disappears, City appears at location
+- Other connected clients see city appear (via broadcast)
 
 ---
 
-## Slice 6: Unit Movement (Asynchronous)
+## Slice 6: GenServer Architecture - Game Supervisor
 
-**Goal:** Player can order a unit to move to a destination tile, and it travels over time.
+**Goal:** Introduce GenServer-based state management with supervision tree.
 
-### Frontend (Angular)
-- Click unit to select, click destination tile to move
-- Display movement path preview
-- Animate unit position updates as it moves tile-by-tile
-- Show ETA for unit arrival
+### Backend (Phoenix)
 
-### Backend (Django)
-- REST API endpoint: `POST /api/units/{unit_id}/move`
-  - Request body: `{ destination_x, destination_y }`
-  - Validation: Player owns unit, destination is valid
-  - Action: Calculate path, calculate total travel time, publish `MovementStarted` event
-- Pathfinding logic: A* or simple Manhattan distance
-- Movement processing: Celery periodic task or event-driven
-  - Option A: Global tick (every 10 seconds) advances all moving units
-  - Option B: Per-unit scheduled tasks for arrival
-- Kafka producer: Publish `MovementStarted`, `UnitMoved` (per tile), `MovementCompleted` events
-- Celery consumer: Process movement events, update unit positions in DB
+**Modules:**
+```
+lib/primordia/
+├── game/
+│   ├── game_supervisor.ex    # DynamicSupervisor for game processes
+│   ├── player_server.ex      # GenServer per player
+│   └── registry.ex           # Process registry helpers
+```
 
-### Database (PostgreSQL)
-- Unit table additions: destination_x, destination_y, arrival_time, path (JSON array)
+**GameSupervisor:**
+```elixir
+defmodule Primordia.Game.GameSupervisor do
+  use DynamicSupervisor
+
+  def start_link(init_arg) do
+    DynamicSupervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
+  end
+
+  def start_player_server(player_id) do
+    DynamicSupervisor.start_child(__MODULE__, {PlayerServer, player_id})
+  end
+end
+```
+
+**PlayerServer:**
+```elixir
+defmodule Primordia.Game.PlayerServer do
+  use GenServer
+
+  def start_link(player_id) do
+    GenServer.start_link(__MODULE__, player_id, name: via_tuple(player_id))
+  end
+
+  def init(player_id) do
+    # Load state from database
+    player = Game.get_player!(player_id)
+    units = Game.list_units(player_id)
+    cities = Game.list_cities(player_id)
+    {:ok, %{player: player, units: units, cities: cities}}
+  end
+
+  # Handle calls for game actions...
+end
+```
+
+**Application Startup:**
+- Add GameSupervisor to application supervision tree
+- Start PlayerServer when player joins Channel
 
 **Acceptance Criteria:**
-- Player can select a unit and click a destination
-- Unit begins moving toward destination
-- Unit position updates in real-time on the map (tile-by-tile)
-- Movement takes calculated real-world time based on distance and unit speed
-- Unit reaches exact destination at calculated time
+- GameSupervisor starts with application
+- Joining Channel starts/finds PlayerServer for that player
+- PlayerServer loads state from database on init
+- Process stays alive between Channel reconnects
 
 ---
 
-## Slice 7: Fog of War
+## Slice 7: Global Tick - Resource Generation
 
-**Goal:** Tiles are hidden until revealed by units or cities.
+**Goal:** Every 10 seconds, all cities generate resources automatically.
 
-### Frontend (Angular)
-- Render tiles as "fog" (gray/black) if not visible to player
-- Reveal tiles when player's units/cities can see them
-- Store visibility state per player
+### Backend (Phoenix)
 
-### Backend (Django)
-- TileVisibility model: player_id, tile_x, tile_y, revealed_at
-- Vision calculation: When unit moves or city founded, calculate visible tiles (radius around position)
-- REST API endpoint: `GET /api/world/visible-tiles` (returns only tiles visible to authenticated player)
-- Update visibility when units move or cities are founded
+**Modules:**
+```
+lib/primordia/
+├── game/
+│   ├── tick_server.ex        # GenServer for global tick
+│   └── resource_calculator.ex # Pure functions for resource math
+```
 
-### Database (PostgreSQL)
-- TileVisibility table (indexed by player_id and tile coordinates)
+**TickServer:**
+```elixir
+defmodule Primordia.Game.TickServer do
+  use GenServer
+
+  @tick_interval 10_000  # 10 seconds
+
+  def start_link(_) do
+    GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
+  end
+
+  def init(state) do
+    schedule_tick()
+    {:ok, state}
+  end
+
+  def handle_info(:tick, state) do
+    # Get all active PlayerServers and send tick message
+    for {player_id, pid} <- Registry.lookup(Primordia.PlayerRegistry, :players) do
+      GenServer.cast(pid, :process_tick)
+    end
+    schedule_tick()
+    {:noreply, %{state | tick_count: state.tick_count + 1}}
+  end
+
+  defp schedule_tick, do: Process.send_after(self(), :tick, @tick_interval)
+end
+```
+
+**PlayerServer tick handling:**
+```elixir
+def handle_cast(:process_tick, state) do
+  {resources, new_state} = ResourceCalculator.calculate_tick(state)
+
+  # Persist to database
+  Game.update_player_resources(state.player.id, resources)
+
+  # Broadcast to connected client
+  PrimordiaWeb.Endpoint.broadcast!("game:player:#{state.player.id}", "resources_tick", resources)
+
+  {:noreply, new_state}
+end
+```
+
+### Frontend (React)
+
+**Updates:**
+- Handle `resources_tick` event in game channel
+- Animate resource counter changes
+- Show tick indicator (optional pulse effect)
 
 **Acceptance Criteria:**
-- New player sees only tiles around their starting Settler
-- As units move, they reveal new tiles
-- Revealed tiles remain visible even after unit leaves (persistent vision)
-- Other players' units are not visible unless in vision range
+- Every 10 seconds, player resources increase
+- Resources update even if player is idle
+- Frontend reflects updates in real-time via Channel
+- Tick continues running when player disconnects (server-side)
 
 ---
 
-## Slice 8: Combat System
+## Slice 8: Building Production Queue (Async with Process.send_after)
 
-**Goal:** When two hostile units occupy the same tile, combat occurs automatically.
+**Goal:** Cities can queue buildings that complete after real-world time.
 
-### Frontend (Angular)
-- Combat animation/notification when battle occurs
-- Display unit health bars
-- Show combat results (winner/loser, damage dealt)
+### Backend (Phoenix)
 
-### Backend (Django)
-- Combat calculation logic: compare unit stats, apply terrain bonuses
-- Trigger: When unit movement completes and destination tile has enemy unit
-- Kafka event: `CombatInitiated`
-- Celery task: `resolve_combat(attacker_id, defender_id, tile_x, tile_y)`
-  - Calculate outcome
-  - Update unit health or remove destroyed units
-  - Publish `CombatResolved` event
-- REST API: Combat log endpoint to retrieve recent battles
+**Database (Ecto):**
+- Migration: Add `production_item`, `production_started_at`, `production_completes_at` to cities
+- Migration: Add `buildings` JSON array field to cities
 
-### Database (PostgreSQL)
-- CombatLog table: attacker_id, defender_id, location, outcome, timestamp
+**Modules:**
+```
+lib/primordia/
+├── game/
+│   ├── city_server.ex        # GenServer per city
+│   ├── building.ex           # Building definitions (Granary, etc.)
+│   └── production.ex         # Production queue logic
+```
+
+**CityServer:**
+```elixir
+defmodule Primordia.Game.CityServer do
+  use GenServer
+
+  def start_link({city_id, player_id}) do
+    GenServer.start_link(__MODULE__, {city_id, player_id}, name: via_tuple(city_id))
+  end
+
+  def init({city_id, player_id}) do
+    city = Game.get_city!(city_id)
+    state = %{city: city, player_id: player_id}
+
+    # Resume any in-progress production
+    state = maybe_schedule_production_completion(state)
+    {:ok, state}
+  end
+
+  def handle_call({:start_production, building_type}, _from, state) do
+    case Production.start_building(state.city, building_type) do
+      {:ok, city, duration_ms} ->
+        # Schedule completion message
+        Process.send_after(self(), {:complete_production, building_type}, duration_ms)
+        {:reply, {:ok, city}, %{state | city: city}}
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_info({:complete_production, building_type}, state) do
+    {:ok, city} = Production.complete_building(state.city, building_type)
+
+    # Persist and broadcast
+    Game.update_city(city)
+    broadcast_to_player(state.player_id, "production_complete", %{
+      city_id: city.id,
+      building: building_type
+    })
+
+    {:noreply, %{state | city: city}}
+  end
+end
+```
+
+**Channel Integration:**
+```elixir
+def handle_in("start_production", %{"city_id" => city_id, "building" => building}, socket) do
+  case CityServer.start_production(city_id, building) do
+    {:ok, city} ->
+      {:reply, {:ok, %{completes_at: city.production_completes_at}}, socket}
+    {:error, reason} ->
+      {:reply, {:error, %{reason: reason}}, socket}
+  end
+end
+```
+
+### Frontend (React)
+
+**Components:**
+- `CityPanel.tsx` - Show city details when selected
+- `ProductionQueue.tsx` - Display current production with countdown
+- `BuildingMenu.tsx` - List available buildings with costs/durations
+
+**State:**
+- Track `production_completes_at` timestamp
+- Display countdown timer
 
 **Acceptance Criteria:**
-- When two hostile units meet on same tile, combat triggers automatically
-- Combat resolution considers unit stats and terrain
-- Defeated units are removed from map
-- Players receive notification of combat results
+- Player can select city and choose "Build Granary"
+- Production timer shows countdown (e.g., 2 minutes)
+- Player can disconnect and reconnect
+- Building completes at exact scheduled time
+- `production_complete` event pushed to client
+- Building effects apply (e.g., Granary increases food generation)
 
 ---
 
-## Slice 9: City Growth & Population
+## Slice 9: Unit Movement (Async with Scheduled Arrivals)
 
-**Goal:** Cities consume food to grow population over time.
+**Goal:** Units move tile-by-tile over real time, with position updates broadcast.
 
-### Frontend (Angular)
-- City detail panel shows population and food stores
-- Display growth progress bar
-- Show specialist assignments (Farmers, Miners, Scientists)
+### Backend (Phoenix)
 
-### Backend (Django)
-- City growth logic: consume food to increase population
-- Enhanced global tick: process city growth for all cities
-  - Accumulate food in `food_stores`
-  - When threshold reached, increase population
-- REST API: Endpoints to view and assign specialists
+**Database (Ecto):**
+- Add to units: `destination_x`, `destination_y`, `arrival_time`, `path` (JSON array)
 
-### Database (PostgreSQL)
-- City table additions: population, food_stores, growth_rate
+**Modules:**
+```
+lib/primordia/
+├── game/
+│   ├── unit_server.ex        # GenServer per unit
+│   ├── pathfinding.ex        # A* or simple pathfinding
+│   └── movement.ex           # Movement calculations
+```
+
+**UnitServer:**
+```elixir
+defmodule Primordia.Game.UnitServer do
+  use GenServer
+
+  def handle_call({:move_to, dest_x, dest_y}, _from, state) do
+    unit = state.unit
+    path = Pathfinding.find_path({unit.x, unit.y}, {dest_x, dest_y})
+
+    case path do
+      [] ->
+        {:reply, {:error, :no_path}, state}
+      path ->
+        # Calculate arrival time based on path length and unit speed
+        arrival_time = Movement.calculate_arrival(path, unit.movement_speed)
+
+        # Schedule arrival
+        Process.send_after(self(), :arrive, arrival_time)
+
+        # Schedule intermediate position updates for animation
+        schedule_position_updates(path, unit.movement_speed)
+
+        updated_unit = %{unit |
+          destination_x: dest_x,
+          destination_y: dest_y,
+          path: path,
+          arrival_time: DateTime.add(DateTime.utc_now(), arrival_time, :millisecond)
+        }
+
+        Game.update_unit(updated_unit)
+        broadcast_movement_started(state.player_id, updated_unit)
+
+        {:reply, {:ok, updated_unit}, %{state | unit: updated_unit}}
+    end
+  end
+
+  def handle_info({:position_update, {x, y}}, state) do
+    unit = %{state.unit | x: x, y: y}
+    broadcast_position(state.player_id, unit)
+    {:noreply, %{state | unit: unit}}
+  end
+
+  def handle_info(:arrive, state) do
+    unit = %{state.unit |
+      x: state.unit.destination_x,
+      y: state.unit.destination_y,
+      destination_x: nil,
+      destination_y: nil,
+      path: nil,
+      arrival_time: nil
+    }
+
+    Game.update_unit(unit)
+    broadcast_arrived(state.player_id, unit)
+
+    # Check for combat at destination
+    check_combat_at_location(unit)
+
+    {:noreply, %{state | unit: unit}}
+  end
+end
+```
+
+### Frontend (React)
+
+**Components:**
+- Click unit to select, click tile to set destination
+- `MovementPath.tsx` - Show path preview line
+- Animate unit sprite along path
+- Show ETA tooltip
+
+**Channel Events:**
+- Send `move_unit` with unit_id and destination
+- Handle `unit_moving`, `unit_position`, `unit_arrived`
+
+**Acceptance Criteria:**
+- Player can order unit to move to destination
+- Unit moves tile-by-tile with visible animation
+- Movement continues even if player disconnects
+- Unit arrives at exact calculated time
+- Other players see unit movement in real-time
+
+---
+
+## Slice 10: Fog of War
+
+**Goal:** Tiles are hidden until revealed by player's units or cities.
+
+### Backend (Phoenix)
+
+**Database (Ecto):**
+- Migration: `tile_visibility` table with `player_id`, `x`, `y`, `revealed_at`
+- Index on `(player_id, x, y)`
+
+**Alternative - ETS for Performance:**
+```elixir
+defmodule Primordia.Game.FogOfWar do
+  use GenServer
+
+  def init(_) do
+    # Create ETS table for fast visibility lookups
+    table = :ets.new(:fog_of_war, [:set, :public, read_concurrency: true])
+    {:ok, %{table: table}}
+  end
+
+  def is_visible?(player_id, x, y) do
+    :ets.lookup(:fog_of_war, {player_id, x, y}) != []
+  end
+
+  def reveal_tiles(player_id, tiles) do
+    entries = Enum.map(tiles, fn {x, y} -> {{player_id, x, y}, true} end)
+    :ets.insert(:fog_of_war, entries)
+
+    # Also persist to database for recovery
+    FogOfWarPersistence.save_revealed(player_id, tiles)
+  end
+end
+```
+
+**Vision Calculation:**
+```elixir
+defmodule Primordia.Game.Vision do
+  @unit_vision_radius 2
+  @city_vision_radius 3
+
+  def tiles_in_vision({x, y}, radius) do
+    for dx <- -radius..radius,
+        dy <- -radius..radius,
+        dx * dx + dy * dy <= radius * radius,
+        do: {x + dx, y + dy}
+  end
+end
+```
+
+**Integration:**
+- Reveal tiles when city founded
+- Reveal tiles as unit moves
+- Filter tile data in API responses to only visible tiles
+
+### Frontend (React)
+
+**Components:**
+- `FogLayer.tsx` - Overlay rendering fog on unrevealed tiles
+- Fog as dark overlay with alpha
+- Revealed tiles stay revealed (no re-fogging)
+
+**Acceptance Criteria:**
+- New player only sees tiles around starting Settler
+- Founding city reveals surrounding tiles
+- Moving unit progressively reveals tiles
+- API only returns visible tile data
+- Revealed tiles persist across sessions
+
+---
+
+## Slice 11: Combat System
+
+**Goal:** When hostile units meet on a tile, combat resolves automatically.
+
+### Backend (Phoenix)
+
+**Database (Ecto):**
+- Migration: `combat_logs` table for battle history
+- Add `health`, `attack`, `defense` fields to units
+
+**Modules:**
+```
+lib/primordia/
+├── game/
+│   ├── combat.ex             # Combat resolution logic
+│   └── combat_server.ex      # Handles combat events
+```
+
+**Combat Resolution:**
+```elixir
+defmodule Primordia.Game.Combat do
+  def resolve(attacker, defender, terrain) do
+    terrain_bonus = terrain_defense_bonus(terrain)
+
+    attacker_roll = attacker.attack * :rand.uniform()
+    defender_roll = defender.defense * terrain_bonus * :rand.uniform()
+
+    damage_to_defender = max(0, round(attacker_roll - defender_roll * 0.5))
+    damage_to_attacker = max(0, round(defender_roll - attacker_roll * 0.5))
+
+    %{
+      attacker_damage: damage_to_attacker,
+      defender_damage: damage_to_defender,
+      attacker_survives: attacker.health > damage_to_attacker,
+      defender_survives: defender.health > damage_to_defender
+    }
+  end
+end
+```
+
+**UnitServer Combat Check:**
+```elixir
+def check_combat_at_location(unit) do
+  case Game.find_enemy_unit_at(unit.x, unit.y, unit.player_id) do
+    nil -> :ok
+    enemy ->
+      result = Combat.resolve(unit, enemy, Game.get_terrain(unit.x, unit.y))
+
+      # Update units based on result
+      apply_combat_result(unit, enemy, result)
+
+      # Broadcast to both players
+      broadcast_combat(unit.player_id, enemy.player_id, result)
+  end
+end
+```
+
+### Frontend (React)
+
+**Components:**
+- `CombatAnimation.tsx` - Flash/effect when combat occurs
+- `CombatLog.tsx` - Show recent battles
+- Health bars on units
+
+**Channel Events:**
+- Handle `combat_result` with attacker, defender, damage, outcome
+
+**Acceptance Criteria:**
+- When unit arrives at tile with enemy, combat triggers
+- Combat result calculated based on stats and terrain
+- Damaged units show reduced health
+- Destroyed units removed from map
+- Both players notified of combat result
+
+---
+
+## Slice 12: City Growth & Population
+
+**Goal:** Cities accumulate food and grow population over time.
+
+### Backend (Phoenix)
+
+**CityServer Enhancement:**
+```elixir
+def handle_cast(:process_tick, state) do
+  city = state.city
+  food_generated = calculate_food_generation(city)
+
+  new_food_stores = city.food_stores + food_generated
+  food_for_growth = city.population * 10
+
+  {new_population, new_food_stores} =
+    if new_food_stores >= food_for_growth do
+      {city.population + 1, new_food_stores - food_for_growth}
+    else
+      {city.population, new_food_stores}
+    end
+
+  updated_city = %{city |
+    population: new_population,
+    food_stores: new_food_stores
+  }
+
+  if new_population > city.population do
+    broadcast_to_player(state.player_id, "city_grew", %{
+      city_id: city.id,
+      new_population: new_population
+    })
+  end
+
+  {:noreply, %{state | city: updated_city}}
+end
+```
+
+### Frontend (React)
+
+**Components:**
+- `CityPanel.tsx` - Show population, food stores, growth progress bar
+- Growth notification when city grows
 
 **Acceptance Criteria:**
 - Cities accumulate food each tick
-- When food threshold reached, city population increases
-- Higher population enables more specialist roles
-- Food production affects growth rate
+- When food threshold reached, population increases
+- Growth progress visible in UI
+- Growth notification pushed to client
 
 ---
 
-## Slice 10: Technology Research
+## Slice 13: Technology Research
 
-**Goal:** Players can research technologies that unlock new units/buildings.
+**Goal:** Players can research technologies that unlock new buildings/units.
 
-### Frontend (Angular)
-- Technology tree UI showing available and researched techs
-- Research selection and progress display
-- Show tech requirements and benefits
+### Backend (Phoenix)
 
-### Backend (Django)
-- Technology model: name, cost, prerequisites, unlocks
-- REST API endpoint: `POST /api/research/start`
-  - Request body: `{ tech_name }`
-  - Validation: Prerequisites met, player has science points
-  - Action: Deduct science, start research timer
-- Celery task: Complete research after duration
-- Update player's tech tree state
+**Database (Ecto):**
+- Migration: Add `tech_tree` (JSON map) to players
+- Migration: `technologies` table with definitions (or hardcoded module)
 
-### Database (PostgreSQL)
-- Technologies table
-- PlayerTech table: player_id, tech_id, researched_at, in_progress
+**Modules:**
+```
+lib/primordia/
+├── game/
+│   ├── technology.ex         # Tech definitions and prerequisites
+│   └── research.ex           # Research logic
+```
+
+**PlayerServer Research:**
+```elixir
+def handle_call({:start_research, tech_name}, _from, state) do
+  case Research.can_research?(state.player, tech_name) do
+    {:ok, cost, duration_ms} ->
+      if state.player.science >= cost do
+        player = %{state.player | science: state.player.science - cost}
+        Process.send_after(self(), {:complete_research, tech_name}, duration_ms)
+
+        {:reply, {:ok, %{completes_at: ...}}, %{state | player: player}}
+      else
+        {:reply, {:error, :insufficient_science}, state}
+      end
+    {:error, reason} ->
+      {:reply, {:error, reason}, state}
+  end
+end
+
+def handle_info({:complete_research, tech_name}, state) do
+  player = Research.complete(state.player, tech_name)
+  Game.update_player(player)
+
+  broadcast_to_player(player.id, "tech_researched", %{tech: tech_name})
+
+  {:noreply, %{state | player: player}}
+end
+```
+
+### Frontend (React)
+
+**Components:**
+- `TechTree.tsx` - Visual tech tree with nodes
+- `ResearchPanel.tsx` - Current research progress
+- Locked/unlocked indicators
 
 **Acceptance Criteria:**
-- Player can select a technology to research
-- Science points are consumed
+- Player can view tech tree
+- Selecting tech starts research (consumes science)
 - Research completes after duration
-- Completed tech unlocks new units/buildings
+- Completed tech unlocks new options
+- Prerequisites enforced
 
 ---
 
-## Slice 11: Real-time Updates via WebSockets
+## Slice 14: Process Recovery & Fault Tolerance
 
-**Goal:** Replace polling with WebSockets for instant updates.
+**Goal:** Ensure game state survives server restarts and process crashes.
 
-### Frontend (Angular)
-- WebSocket service to connect to backend
-- Subscribe to channels: player state, world events, combat notifications
-- Update UI reactively when events received
+### Backend (Phoenix)
 
-### Backend (Django)
-- Django Channels integration for WebSocket support
-- Kafka consumer publishes events to WebSocket channels
-- WebSocket routing for authenticated connections
-- Send targeted updates to specific players
+**State Persistence Strategy:**
+```elixir
+defmodule Primordia.Game.PlayerServer do
+  # Periodic state snapshot
+  def init(player_id) do
+    state = load_state_from_db(player_id)
+    schedule_snapshot()
+    {:ok, state}
+  end
 
-### Infrastructure
-- Install Django Channels and configure ASGI
-- Redis channel layer for Django Channels
+  def handle_info(:snapshot, state) do
+    persist_state(state)
+    schedule_snapshot()
+    {:noreply, state}
+  end
+
+  defp schedule_snapshot do
+    Process.send_after(self(), :snapshot, 30_000)  # Every 30s
+  end
+
+  # Recover scheduled actions on restart
+  defp load_state_from_db(player_id) do
+    state = # ... load from DB
+
+    # Re-schedule any pending productions
+    for city <- state.cities, city.production_completes_at do
+      remaining_ms = DateTime.diff(city.production_completes_at, DateTime.utc_now(), :millisecond)
+      if remaining_ms > 0 do
+        Process.send_after(self(), {:complete_production, city.id}, remaining_ms)
+      else
+        # Complete immediately if past due
+        send(self(), {:complete_production, city.id})
+      end
+    end
+
+    state
+  end
+end
+```
+
+**Supervision Configuration:**
+```elixir
+# In application.ex
+children = [
+  Primordia.Repo,
+  {Phoenix.PubSub, name: Primordia.PubSub},
+  PrimordiaWeb.Endpoint,
+  {Registry, keys: :unique, name: Primordia.GameRegistry},
+  {DynamicSupervisor, name: Primordia.GameSupervisor, strategy: :one_for_one}
+]
+```
 
 **Acceptance Criteria:**
-- Player receives instant notifications for game events
-- Resource updates appear without polling
-- Unit movements and combat results push to client immediately
-- Connection handles disconnects gracefully
+- Server can restart without losing game state
+- In-progress productions resume correctly after restart
+- Moving units continue to their destinations
+- Player reconnect receives accurate current state
 
 ---
 
-## Slice 12: Concurrency & Event Ordering
+## Slice 15: Concurrency Testing & Race Conditions
 
-**Goal:** Ensure perfect "first-come, first-served" integrity for concurrent actions.
+**Goal:** Verify system handles concurrent actions correctly.
 
-### Backend (Django)
-- Implement optimistic locking or database transactions for critical operations
-- Kafka partition keys to ensure ordered processing of related events
-- Event timestamp tracking and ordering logic
-- Handle race conditions (e.g., two players moving to same tile)
+### Backend (Phoenix)
 
-### Infrastructure (Kafka)
-- Configure Kafka partitioning strategy by game world regions
-- Celery task idempotency checks
+**Test Scenarios:**
+```elixir
+defmodule Primordia.ConcurrencyTest do
+  use ExUnit.Case
 
-### Database (PostgreSQL)
-- Add version fields or timestamps for optimistic locking
-- Database transactions for atomic operations
+  test "two players moving to same tile - first arrival wins" do
+    # Setup two players with units near same tile
+    # Send simultaneous move commands
+    # Verify first to arrive occupies tile
+    # Verify second triggers combat
+  end
+
+  test "rapid commands to same city are serialized" do
+    # Send 100 production commands rapidly
+    # Verify all processed in order
+    # Verify no race conditions
+  end
+
+  test "player reconnect during unit movement" do
+    # Start unit movement
+    # Kill PlayerServer
+    # Reconnect
+    # Verify movement completes correctly
+  end
+end
+```
+
+**Load Testing:**
+- Use `benchee` for performance benchmarks
+- Test with simulated multiple concurrent players
+- Monitor GenServer message queue lengths
 
 **Acceptance Criteria:**
-- When two players simultaneously attempt to claim same resource, first request succeeds
-- Events are processed in exact order they were initiated
-- No duplicate processing of events
-- System handles concurrent writes without data corruption
+- No race conditions under concurrent load
+- First-come-first-served integrity maintained
+- No duplicate events or lost updates
+- Performance metrics within targets
 
 ---
 
-## Slice 13: Multiple Unit Types & Advanced Combat
+## Implementation Order
 
-**Goal:** Add Warriors, Archers, Cavalry with different stats and abilities.
+### Phase 1: Foundation (Slices 1-4)
+1. **Slice 1:** Project setup, database, static world
+2. **Slice 2:** Authentication
+3. **Slice 3:** Player state and units
+4. **Slice 4:** Phoenix Channels real-time connection
 
-### Frontend (Angular)
-- Different unit icons for each type
-- Unit stat display (attack, defense, movement speed)
-- Combat preview showing odds
+### Phase 2: Core Gameplay (Slices 5-9)
+5. **Slice 5:** City founding
+6. **Slice 6:** GenServer architecture
+7. **Slice 7:** Global tick
+8. **Slice 8:** Building production
+9. **Slice 9:** Unit movement
 
-### Backend (Django)
-- Extend Unit model with unit_type enum and type-specific stats
-- Enhanced combat calculation with rock-paper-scissors mechanics
-- Unit training in cities (production queue)
+### Phase 3: Strategic Depth (Slices 10-13)
+10. **Slice 10:** Fog of war
+11. **Slice 11:** Combat
+12. **Slice 12:** City growth
+13. **Slice 13:** Technology research
 
-### Database (PostgreSQL)
-- UnitTypes reference table or enum
-
-**Acceptance Criteria:**
-- Players can train different unit types in cities
-- Each unit type has distinct stats and movement speed
-- Combat calculations consider unit type matchups
-
----
-
-## Slice 14: Diplomacy & Trading
-
-**Goal:** Players can trade resources and form alliances.
-
-### Frontend (Angular)
-- Diplomacy UI showing other players
-- Trade offer creation and acceptance
-- Alliance/war status display
-
-### Backend (Django)
-- Diplomacy model: player relationships (neutral, allied, at war)
-- Trade offer model: sender, receiver, offered resources, requested resources
-- REST API endpoints for diplomacy actions
-- Kafka events for trade offers and status changes
-
-### Database (PostgreSQL)
-- PlayerRelationships table
-- TradeOffers table
-
-**Acceptance Criteria:**
-- Players can send trade offers to each other
-- Trade offers can be accepted or rejected
-- Players can declare war or form alliances
-- Diplomatic status affects combat and visibility
+### Phase 4: Production Hardening (Slices 14-15)
+14. **Slice 14:** Fault tolerance
+15. **Slice 15:** Concurrency testing
 
 ---
 
-## Slice 15: Victory Conditions & Game End
+## Development Tips
 
-**Goal:** Implement win conditions and game completion.
+### Elixir/Phoenix Specifics
 
-### Frontend (Angular)
-- Victory progress tracking UI
-- End game screen showing winner
-- Leaderboard
+```bash
+# Create project
+mix phx.new primordia --database postgres
 
-### Backend (Django)
-- Victory condition checks (e.g., reach Space Flight tech, capture all capitals)
-- Game state model (in progress, completed)
-- End game processing and player ranking
-- Kafka event: `GameEnded`
+# Generate context and schema
+mix phx.gen.context Game Player players user_id:references:users gold:integer
 
-### Database (PostgreSQL)
-- GameSessions table
-- PlayerScores table
+# Generate Channel
+mix phx.gen.channel Game
 
-**Acceptance Criteria:**
-- System detects when victory condition is met
-- Game ends and winner is declared
-- Players can view final game state and statistics
-- New games can be started
+# Run with IEx for debugging
+iex -S mix phx.server
 
----
+# Observer for process inspection
+:observer.start()
+```
 
-## Implementation Order Recommendation
+### Testing GenServers
 
-1. **Slices 1-3:** Core authentication, world, and basic gameplay (synchronous actions)
-2. **Slice 4:** Global tick infrastructure (asynchronous foundation)
-3. **Slices 5-6:** Asynchronous building and movement (core event-driven gameplay)
-4. **Slice 7:** Fog of war (strategic layer)
-5. **Slice 8:** Combat (player interaction)
-6. **Slice 11:** Real-time updates (UX improvement - can be done earlier if desired)
-7. **Slices 9-10:** City growth and tech (depth mechanics)
-8. **Slice 12:** Concurrency hardening (scalability)
-9. **Slices 13-15:** Advanced features (polish and completion)
+```elixir
+# In test setup
+{:ok, pid} = PlayerServer.start_link(player_id)
 
-Each slice is independently deployable and testable, providing incremental value while building toward the complete game.
+# Make synchronous call
+result = GenServer.call(pid, {:found_city, settler_id, "Rome"})
+
+# Assert on result
+assert {:ok, city} = result
+assert city.name == "Rome"
+```
+
+### Debugging Tips
+
+- Use `IO.inspect(value, label: "debug")` liberally
+- `:sys.get_state(pid)` to inspect GenServer state
+- LiveDashboard at `/dev/dashboard` for real-time monitoring
+- `Process.whereis(name)` to find registered processes
+
+Each slice is independently deployable and testable, building toward a complete real-time strategy game that showcases Elixir/OTP's strengths.
