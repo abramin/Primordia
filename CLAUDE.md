@@ -2,15 +2,15 @@
 
 ## Introduction
 
-This document defines the architectural patterns and design principles for **Primordia**, a real-time strategy game. These guidelines are based on Domain-Driven Design (DDD), CQRS, and event-driven architecture patterns to ensure the system is maintainable, scalable, and robust.
+This document defines the architectural patterns and design principles for **Primordia**, a real-time strategy game built on Elixir/OTP. These guidelines leverage functional programming, the Actor model, and OTP supervision to build a maintainable, fault-tolerant, and highly concurrent system.
 
 The key principles guiding our architecture are:
 
-1. **Rich domain models** that encapsulate business logic
-2. **Clear separation** between command (write) and query (read) responsibilities
-3. **Event-driven architecture** for asynchronous game state evolution
-4. **Transactional consistency** at aggregate boundaries
-5. **Domain events** as the primary mechanism for system integration
+1. **Functional core, imperative shell** - Pure domain logic, side effects at boundaries
+2. **Process-per-entity** - Each game entity (player, city, unit) as a supervised GenServer
+3. **Message-passing concurrency** - No shared mutable state, all communication via messages
+4. **Let it crash** - Embrace failures with supervision and recovery
+5. **Event-driven updates** - Phoenix PubSub for real-time client synchronization
 
 ---
 
@@ -18,27 +18,28 @@ The key principles guiding our architecture are:
 
 1. [Domain Model Overview](#domain-model-overview)
 2. [Layer Responsibilities](#layer-responsibilities)
-3. [Aggregate Roots and Boundaries](#aggregate-roots-and-boundaries)
-4. [Domain Events](#domain-events)
-5. [Command and Query Separation (CQRS)](#command-and-query-separation-cqrs)
-6. [Transaction Management](#transaction-management)
-7. [Asynchronous Processing](#asynchronous-processing)
-8. [Code Organization](#code-organization)
-9. [Testing Strategy](#testing-strategy)
-10. [Common Patterns and Examples](#common-patterns-and-examples)
+3. [Process Architecture](#process-architecture)
+4. [Domain Logic & Pure Functions](#domain-logic--pure-functions)
+5. [State Management with GenServers](#state-management-with-genservers)
+6. [Event Broadcasting with PubSub](#event-broadcasting-with-pubsub)
+7. [Persistence with Ecto](#persistence-with-ecto)
+8. [Phoenix Channels & Real-time](#phoenix-channels--real-time)
+9. [Code Organization](#code-organization)
+10. [Testing Strategy](#testing-strategy)
+11. [Common Patterns and Examples](#common-patterns-and-examples)
 
 ---
 
 ## Domain Model Overview
 
-### Core Aggregates
+### Core Entities
 
-Primordia's domain is organized around four primary aggregates:
+Primordia's domain is organized around four primary entities, each managed by its own process:
 
-1. **Player Aggregate** - Manages player identity, resources, and technology
-2. **City Aggregate** - Manages city state, population, production queues
-3. **Unit Aggregate** - Manages unit state, movement, and combat
-4. **World/Tile Aggregate** - Manages the game map, tile properties, and fog of war
+1. **Player** - Manages player identity, resources, and technology
+2. **City** - Manages city state, population, production queues
+3. **Unit** - Manages unit state, movement, and combat
+4. **World/Tiles** - Manages the game map, tile properties, and fog of war
 
 ### Ubiquitous Language
 
@@ -55,1152 +56,1013 @@ Primordia's domain is organized around four primary aggregates:
 
 ## Layer Responsibilities
 
-### Domain Layer
+### Domain Layer (`lib/primordia/game/`)
 
-**Purpose:** Contains the core business logic, entities, value objects, domain services, and domain events.
+**Purpose:** Contains pure business logic as stateless functions operating on data structures.
 
 **Responsibilities:**
-- Define and enforce business rules and invariants
-- Model the game's core concepts (City, Unit, Player, Tile)
-- Create and record domain events when significant business actions occur
-- Remain free of infrastructure concerns (no database, no HTTP, no external APIs)
+- Define data structures (structs) representing game state
+- Implement business rules as pure functions
+- Validate state transitions
+- Calculate derived values (resource generation, combat outcomes)
 
 **What belongs here:**
-- Entities: `City`, `Unit`, `Player`, `Tile`
-- Value Objects: `Coordinates`, `ResourceAmount`, `TileType`, `UnitType`
-- Domain Services: `CityFounder`, `UnitMover`, `CombatResolver`, `ProductionCalculator`
-- Domain Events: `CityFoundedEvent`, `UnitMovedEvent`, `CombatOccurredEvent`, `BuildingCompletedEvent`
-- Repository Interfaces: `CityRepository`, `UnitRepository`, `PlayerRepository`
+- Data Structs: `City`, `Unit`, `Player`, `Tile`
+- Value Objects: `Coordinates`, `ResourceAmount`, `TerrainType`, `UnitType`
+- Domain Logic Modules: `CityFounder`, `Movement`, `Combat`, `ResourceCalculator`
+- Validation Functions: Pure functions that return `{:ok, result}` or `{:error, reason}`
 
 **Example:**
-```python
-# domain/entities/city.py
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
-from domain.value_objects import Coordinates, ResourceAmount
-from domain.events import CityFoundedEvent, BuildingCompletedEvent
+```elixir
+# lib/primordia/game/city.ex
+defmodule Primordia.Game.City do
+  @moduledoc """
+  City data structure and pure domain logic.
+  """
 
-class City(AggregateRoot):
-    """
-    City aggregate root - manages city state, production, and growth.
-    """
+  defstruct [
+    :id,
+    :name,
+    :player_id,
+    :x,
+    :y,
+    population: 1,
+    food_stores: 0,
+    production_queue: [],
+    buildings: [],
+    production_item: nil,
+    production_completes_at: nil
+  ]
 
-    def __init__(
-        self,
-        city_id: str,
-        name: str,
-        owner_id: str,
-        coordinates: Coordinates,
-        population: int = 1,
-        food_stores: int = 0
-    ):
-        super().__init__()
-        self.__city_id = city_id
-        self.__name = name
-        self.__owner_id = owner_id
-        self.__coordinates = coordinates
-        self.__population = population
-        self.__food_stores = food_stores
-        self.__production_queue: list[ProductionItem] = []
-        self.__completed_buildings: list[str] = []
+  @type t :: %__MODULE__{
+    id: String.t(),
+    name: String.t(),
+    player_id: String.t(),
+    x: integer(),
+    y: integer(),
+    population: pos_integer(),
+    food_stores: non_neg_integer(),
+    production_queue: list(String.t()),
+    buildings: list(String.t()),
+    production_item: String.t() | nil,
+    production_completes_at: DateTime.t() | nil
+  }
 
-    @classmethod
-    def found(
-        cls,
-        city_id: str,
-        name: str,
-        owner_id: str,
-        coordinates: Coordinates
-    ) -> "City":
-        """
-        Factory method to found a new city.
-        Records CityFoundedEvent.
-        """
-        city = cls(city_id, name, owner_id, coordinates)
-        city.record(CityFoundedEvent(
-            city_id=city_id,
-            name=name,
-            owner_id=owner_id,
-            x=coordinates.x,
-            y=coordinates.y,
-            founded_at=datetime.utcnow().isoformat()
-        ))
-        return city
+  @doc """
+  Creates a new city. Pure function - no side effects.
+  """
+  @spec new(String.t(), String.t(), integer(), integer(), String.t()) :: t()
+  def new(id, name, player_id, x, y) do
+    %__MODULE__{
+      id: id,
+      name: name,
+      player_id: player_id,
+      x: x,
+      y: y
+    }
+  end
 
-    def add_production_item(self, item: ProductionItem) -> None:
-        """
-        Adds a building or unit to the production queue.
-        Validates that the city is not at production capacity.
-        """
-        if len(self.__production_queue) >= 10:
-            raise ProductionQueueFullError("Cannot add more than 10 items to queue")
+  @doc """
+  Adds a building to the production queue.
+  Returns {:ok, updated_city} or {:error, reason}.
+  """
+  @spec add_to_queue(t(), String.t()) :: {:ok, t()} | {:error, atom()}
+  def add_to_queue(%__MODULE__{production_queue: queue} = city, building_type)
+      when length(queue) >= 10 do
+    {:error, :queue_full}
+  end
 
-        self.__production_queue.append(item)
+  def add_to_queue(%__MODULE__{} = city, building_type) do
+    {:ok, %{city | production_queue: city.production_queue ++ [building_type]}}
+  end
 
-    def complete_production(self, item_type: str) -> None:
-        """
-        Marks a production item as completed.
-        Records BuildingCompletedEvent or UnitCompletedEvent.
-        """
-        if not self.__production_queue:
-            raise NothingInProductionError("No items in production queue")
+  @doc """
+  Starts production of next item in queue.
+  """
+  @spec start_production(t(), DateTime.t()) :: {:ok, t(), integer()} | {:error, atom()}
+  def start_production(%__MODULE__{production_queue: []} = _city, _now) do
+    {:error, :empty_queue}
+  end
 
-        completed_item = self.__production_queue.pop(0)
+  def start_production(%__MODULE__{production_item: item} = _city, _now)
+      when not is_nil(item) do
+    {:error, :already_producing}
+  end
 
-        if completed_item.item_type != item_type:
-            raise InvalidProductionStateError(
-                f"Expected {completed_item.item_type}, got {item_type}"
-            )
+  def start_production(%__MODULE__{production_queue: [item | rest]} = city, now) do
+    duration_ms = production_duration(item)
+    completes_at = DateTime.add(now, duration_ms, :millisecond)
 
-        if completed_item.is_building:
-            self.__completed_buildings.append(item_type)
-            self.record(BuildingCompletedEvent(
-                city_id=self.__city_id,
-                building_type=item_type,
-                completed_at=datetime.utcnow().isoformat()
-            ))
+    updated_city = %{city |
+      production_item: item,
+      production_completes_at: completes_at,
+      production_queue: rest
+    }
 
-    def apply_food_growth(self, food_amount: int) -> None:
-        """
-        Adds food to stores and potentially grows population.
-        """
-        self.__food_stores += food_amount
+    {:ok, updated_city, duration_ms}
+  end
 
-        food_needed_for_growth = self.__population * 10
-        if self.__food_stores >= food_needed_for_growth:
-            self.__food_stores -= food_needed_for_growth
-            self.__population += 1
+  @doc """
+  Completes current production, adding building to city.
+  """
+  @spec complete_production(t()) :: {:ok, t(), String.t()} | {:error, atom()}
+  def complete_production(%__MODULE__{production_item: nil}) do
+    {:error, :nothing_in_production}
+  end
 
-    # Getters for read access
-    def city_id(self) -> str:
-        return self.__city_id
+  def complete_production(%__MODULE__{production_item: item, buildings: buildings} = city) do
+    updated_city = %{city |
+      buildings: [item | buildings],
+      production_item: nil,
+      production_completes_at: nil
+    }
 
-    def name(self) -> str:
-        return self.__name
+    {:ok, updated_city, item}
+  end
 
-    def owner_id(self) -> str:
-        return self.__owner_id
+  @doc """
+  Applies food from a tick, potentially growing population.
+  Pure function - calculates new state.
+  """
+  @spec apply_food_tick(t(), integer()) :: {t(), boolean()}
+  def apply_food_tick(%__MODULE__{} = city, food_generated) do
+    new_food_stores = city.food_stores + food_generated
+    food_for_growth = city.population * 10
 
-    def population(self) -> int:
-        return self.__population
+    if new_food_stores >= food_for_growth do
+      updated_city = %{city |
+        population: city.population + 1,
+        food_stores: new_food_stores - food_for_growth
+      }
+      {updated_city, true}  # true = grew
+    else
+      {%{city | food_stores: new_food_stores}, false}
+    end
+  end
+
+  # Private helpers
+  defp production_duration("granary"), do: 120_000  # 2 minutes
+  defp production_duration("barracks"), do: 180_000  # 3 minutes
+  defp production_duration("walls"), do: 300_000     # 5 minutes
+  defp production_duration(_), do: 60_000            # 1 minute default
+end
 ```
 
-### Application Layer
+### Application Layer (`lib/primordia/game/servers/`)
 
-**Purpose:** Orchestrates use cases, manages transactions, and coordinates domain objects.
+**Purpose:** GenServers that manage state and orchestrate domain logic.
 
 **Responsibilities:**
-- Handle commands and queries via command/query handlers
-- Manage database transactions using `UnitOfWork`
-- Persist entities via repositories
-- Publish domain events via the event bus
-- Delegate all business logic to the domain layer
+- Maintain in-memory state for game entities
+- Process commands by delegating to domain functions
+- Schedule delayed actions with `Process.send_after/3`
+- Coordinate persistence via Ecto
+- Broadcast events via PubSub
 
 **What belongs here:**
-- Command Handlers: `FoundCityCommandHandler`, `MoveUnitCommandHandler`, `StartProductionCommandHandler`
-- Query Handlers: `GetPlayerCitiesQueryHandler`, `GetVisibleTilesQueryHandler`
-- Commands: `FoundCityCommand`, `MoveUnitCommand`, `StartProductionCommand`
-- Queries: `GetPlayerCitiesQuery`, `GetVisibleTilesQuery`
+- GenServers: `PlayerServer`, `CityServer`, `UnitServer`, `TickServer`
+- Supervisors: `GameSupervisor`, `PlayerSupervisor`
+- Process registration and lookup utilities
 
 **Example:**
-```python
-# application/commands/found_city_command.py
-from dataclasses import dataclass
-
-@dataclass
-class FoundCityCommand:
-    """
-    Command to found a new city at specified coordinates.
-    All fields must be JSON-serializable primitives.
-    """
-    player_id: str
-    settler_unit_id: str
-    city_name: str
-    x: int
-    y: int
-
-
-# application/handlers/found_city_command_handler.py
-class FoundCityCommandHandler:
-    """
-    Handles the FoundCityCommand.
-
-    Responsibilities:
-    - Validate the settler exists and belongs to the player
-    - Validate the location is valid for city founding
-    - Create the city via domain service
-    - Remove the settler unit
-    - Persist changes within a transaction
-    - Publish domain events
-    """
-
-    def __init__(
-        self,
-        city_founder: CityFounder,
-        city_repository: CityRepository,
-        unit_repository: UnitRepository,
-        player_repository: PlayerRepository,
-        event_bus: EventBus,
-        unit_of_work: UnitOfWork,
-        logger: Logger
-    ):
-        self.__city_founder = city_founder
-        self.__city_repository = city_repository
-        self.__unit_repository = unit_repository
-        self.__player_repository = player_repository
-        self.__event_bus = event_bus
-        self.__unit_of_work = unit_of_work
-        self.__logger = logger
-
-    def handle(self, command: FoundCityCommand) -> None:
-        """
-        Executes the command to found a city.
-        All side effects happen within a single transaction.
-        """
-        # Fetch required aggregates
-        player = self.__player_repository.find_or_fail_by_id(command.player_id)
-        settler = self.__unit_repository.find_or_fail_by_id(command.settler_unit_id)
-
-        # Validate ownership
-        if settler.owner_id() != player.player_id():
-            raise UnauthorizedActionError("Settler does not belong to player")
-
-        # Use domain service to create city and get events
-        coordinates = Coordinates(command.x, command.y)
-        city = self.__city_founder.found_city(
-            city_name=command.city_name,
-            owner=player,
-            settler=settler,
-            coordinates=coordinates
-        )
-
-        # Settler is consumed when founding city
-        settler.consume()
-
-        # Persist all changes and publish events in one transaction
-        with self.__unit_of_work():
-            self.__city_repository.save(city)
-            self.__unit_repository.save(settler)  # Marks as consumed
-            self.__event_bus.bulk_publish(city.pull_events())
-
-        self.__logger.info(f"City {city.name()} founded at ({command.x}, {command.y})")
-```
-
-### Infrastructure Layer
-
-**Purpose:** Provides concrete implementations of interfaces defined in the domain.
-
-**Responsibilities:**
-- Implement repository interfaces using specific persistence technology (PostgreSQL, Redis, etc.)
-- Implement event bus using message queue (RabbitMQ, Kafka, etc.)
-- Provide HTTP controllers/API views
-- Manage database connections and sessions
-- Handle serialization/deserialization
-
-**What belongs here:**
-- Repository Implementations: `PostgresCityRepository`, `PostgresUnitRepository`
-- Event Bus Implementation: `RabbitMQEventBus`
-- API Controllers: `FoundCityAPIView`, `MoveUnitAPIView`
-- Database Models (ORM): `CityModel`, `UnitModel` (Django/SQLAlchemy models)
-- External Service Adapters
-
-**Example:**
-```python
-# infrastructure/persistence/postgres_city_repository.py
-from domain.repositories import CityRepository
-from domain.entities import City
-from infrastructure.models import CityModel
-
-class PostgresCityRepository(CityRepository):
-    """
-    Concrete implementation of CityRepository using PostgreSQL.
-    """
-
-    def save(self, city: City) -> None:
-        """Persists city to database."""
-        city_model = CityModel.objects.get(id=city.city_id())
-        city_model.name = city.name()
-        city_model.population = city.population()
-        city_model.food_stores = city.food_stores()
-        # ... map other fields
-        city_model.save()
-
-    def find_by_id(self, city_id: str) -> Optional[City]:
-        """Retrieves city by ID, returns None if not found."""
-        try:
-            city_model = CityModel.objects.get(id=city_id)
-            return self.__to_domain(city_model)
-        except CityModel.DoesNotExist:
-            return None
-
-    def find_or_fail_by_id(self, city_id: str) -> City:
-        """Retrieves city by ID, raises exception if not found."""
-        city = self.find_by_id(city_id)
-        if city is None:
-            raise CityNotFoundError(f"City {city_id} not found")
-        return city
-
-    def __to_domain(self, city_model: CityModel) -> City:
-        """Maps ORM model to domain entity."""
-        return City(
-            city_id=str(city_model.id),
-            name=city_model.name,
-            owner_id=str(city_model.owner_id),
-            coordinates=Coordinates(city_model.x, city_model.y),
-            population=city_model.population,
-            food_stores=city_model.food_stores
-        )
-```
-
----
-
-## Aggregate Roots and Boundaries
-
-### What is an Aggregate?
-
-An **Aggregate** is a cluster of domain objects (entities and value objects) that are treated as a single unit for data changes. Each aggregate has a root entity called the **Aggregate Root**, which is the only entry point for modifying anything inside the aggregate.
-
-### Primordia's Aggregates
-
-#### 1. Player Aggregate
-
-**Root:** `Player`
-
-**Responsibilities:**
-- Manage player identity and authentication state
-- Track empire-wide resources (gold, science, food)
-- Manage technology tree progression
-- Track diplomatic relations (future)
-
-**Invariants:**
-- Resources cannot be negative
-- Technology prerequisites must be met before unlocking new tech
-- Player username must be unique
-
-**Example:**
-```python
-class Player(AggregateRoot):
-    def __init__(
-        self,
-        player_id: str,
-        username: str,
-        gold: int = 100,
-        science: int = 0
-    ):
-        super().__init__()
-        self.__player_id = player_id
-        self.__username = username
-        self.__gold = gold
-        self.__science = science
-        self.__researched_technologies: set[str] = set()
-
-    def spend_gold(self, amount: int) -> None:
-        """Deducts gold, enforcing non-negative constraint."""
-        if self.__gold < amount:
-            raise InsufficientResourcesError(
-                f"Need {amount} gold, have {self.__gold}"
-            )
-        self.__gold -= amount
-
-    def add_gold(self, amount: int) -> None:
-        """Adds gold from resource generation."""
-        self.__gold += amount
-
-    def research_technology(self, tech_name: str, cost: int) -> None:
-        """
-        Researches a new technology.
-        Validates prerequisites and science cost.
-        """
-        if tech_name in self.__researched_technologies:
-            raise TechnologyAlreadyResearchedError(tech_name)
-
-        # Domain logic: validate prerequisites
-        prerequisites = self.__get_tech_prerequisites(tech_name)
-        if not prerequisites.issubset(self.__researched_technologies):
-            raise PrerequisitesNotMetError(
-                f"{tech_name} requires {prerequisites}"
-            )
-
-        self.spend_science(cost)
-        self.__researched_technologies.add(tech_name)
-
-        self.record(TechnologyResearchedEvent(
-            player_id=self.__player_id,
-            technology=tech_name,
-            researched_at=datetime.utcnow().isoformat()
-        ))
-```
-
-#### 2. City Aggregate
-
-**Root:** `City`
-
-**Responsibilities:**
-- Manage city growth and population
-- Manage production queue (buildings and units)
-- Calculate resource generation (food, production)
-- Manage city borders and worked tiles
-
-**Invariants:**
-- Population must be positive
-- Production queue cannot exceed capacity
-- Cannot build same building twice
-- Food stores cannot be negative
-
-**Bounded within:** Single city - does not manage units created by the city
-
-#### 3. Unit Aggregate
-
-**Root:** `Unit`
-
-**Responsibilities:**
-- Manage unit position and movement
-- Track movement paths and arrival times
-- Handle combat initiation
-- Manage unit health and experience
-
-**Invariants:**
-- Unit cannot move to invalid terrain (e.g., land unit to water)
-- Health must be between 0 and max health
-- Cannot move while already moving
-- Destination must be within movement range
-
-**Example:**
-```python
-class Unit(AggregateRoot):
-    def move_to(
-        self,
-        destination: Coordinates,
-        movement_calculator: MovementCalculator
-    ) -> None:
-        """
-        Initiates movement to destination.
-        Calculates path and arrival time.
-        """
-        if self.__is_moving:
-            raise UnitAlreadyMovingError("Unit is already moving")
-
-        # Use domain service to calculate movement
-        path, arrival_time = movement_calculator.calculate_path(
-            from_coords=self.__current_location,
-            to_coords=destination,
-            unit_type=self.__unit_type,
-            movement_points=self.__movement_points
-        )
-
-        if not path:
-            raise InvalidDestinationError("No valid path to destination")
-
-        self.__destination = destination
-        self.__arrival_time = arrival_time
-        self.__is_moving = True
-
-        self.record(UnitMovementStartedEvent(
-            unit_id=self.__unit_id,
-            from_x=self.__current_location.x,
-            from_y=self.__current_location.y,
-            to_x=destination.x,
-            to_y=destination.y,
-            arrival_time=arrival_time.isoformat(),
-            unit_type=self.__unit_type.value
-        ))
-
-    def complete_movement(self) -> None:
-        """
-        Called when arrival time is reached.
-        Updates position and marks movement as complete.
-        """
-        if not self.__is_moving:
-            raise UnitNotMovingError("Unit is not currently moving")
-
-        if datetime.utcnow() < self.__arrival_time:
-            raise ArrivalTimeNotReachedError("Unit has not reached destination yet")
-
-        self.__current_location = self.__destination
-        self.__is_moving = False
-        self.__destination = None
-        self.__arrival_time = None
-
-        self.record(UnitArrivedEvent(
-            unit_id=self.__unit_id,
-            x=self.__current_location.x,
-            y=self.__current_location.y,
-            arrived_at=datetime.utcnow().isoformat()
-        ))
-```
-
-#### 4. World/Tile Aggregate
-
-**Root:** `World` (or `GameMap`)
-
-**Contains:** Collection of `Tile` entities
-
-**Responsibilities:**
-- Manage tile properties (terrain type, resources)
-- Manage fog of war per player
-- Handle tile visibility calculations
-- Manage global world state
-
-**Invariants:**
-- Tile coordinates must be within world bounds
-- Each coordinate must have exactly one tile
-- Fog of war state is per-player
-
-**Design Note:** This aggregate is potentially very large (100x100 = 10,000 tiles). Consider:
-- Loading tiles in chunks/regions
-- Using a separate read model for queries
-- Optimizing fog of war updates
-
----
-
-## Domain Events
-
-Domain events are the primary mechanism for:
-1. Communicating that something significant happened in the domain
-2. Triggering asynchronous workflows
-3. Maintaining eventual consistency across aggregates
-4. Integrating with external systems
-
-### Event Design Principles
-
-1. **Events are immutable** - once created, they cannot be changed
-2. **Events are self-contained** - carry all relevant context, not just IDs
-3. **Events are past-tense** - `CityFoundedEvent`, not `FoundCityEvent`
-4. **Events contain JSON-serializable primitives only** - strings, ints, bools, lists, dicts
-5. **Events are created in the domain layer** - never in application or infrastructure
-6. **Events are published in the application layer** - within the same transaction as persistence
-
-### Core Events
-
-```python
-# domain/events/city_events.py
-from dataclasses import dataclass
-
-@dataclass
-class CityFoundedEvent:
-    """
-    Emitted when a new city is founded.
-
-    Consumers might:
-    - Update player statistics
-    - Reveal tiles around city
-    - Initialize city borders
-    - Send notification to player
-    """
-    city_id: str
-    name: str
-    owner_id: str
-    x: int
-    y: int
-    founded_at: str  # ISO-8601 timestamp
-
-
-@dataclass
-class BuildingCompletedEvent:
-    """
-    Emitted when a building finishes construction.
-
-    Consumers might:
-    - Apply building effects to city
-    - Start next item in production queue
-    - Send notification to player
-    """
-    city_id: str
-    building_type: str  # e.g., "granary", "barracks"
-    completed_at: str
-
-
-@dataclass
-class PopulationGrownEvent:
-    """
-    Emitted when a city's population increases.
-
-    Consumers might:
-    - Update player statistics dashboard
-    - Check for new citizen assignment
-    - Send notification to player
-    """
-    city_id: str
-    city_name: str
-    new_population: int
-    grown_at: str
-
-
-# domain/events/unit_events.py
-@dataclass
-class UnitMovementStartedEvent:
-    """
-    Emitted when a unit begins moving.
-
-    Consumers might:
-    - Update fog of war along path
-    - Check for potential combat encounters
-    - Update UI with movement animation
-    """
-    unit_id: str
-    owner_id: str
-    unit_type: str
-    from_x: int
-    from_y: int
-    to_x: int
-    to_y: int
-    arrival_time: str
-
-
-@dataclass
-class UnitArrivedEvent:
-    """
-    Emitted when a unit reaches its destination.
-
-    Consumers might:
-    - Reveal fog of war at new location
-    - Check for combat with other units
-    - Update tile occupation
-    - Send notification to player
-    """
-    unit_id: str
-    owner_id: str
-    unit_type: str
-    x: int
-    y: int
-    arrived_at: str
-
-
-@dataclass
-class CombatOccurredEvent:
-    """
-    Emitted when two hostile units engage in combat.
-
-    Consumers might:
-    - Update player war statistics
-    - Award experience to victor
-    - Send battle report to players
-    - Check for unit destruction
-    """
-    attacker_unit_id: str
-    attacker_owner_id: str
-    defender_unit_id: str
-    defender_owner_id: str
-    location_x: int
-    location_y: int
-    attacker_damage_dealt: int
-    defender_damage_dealt: int
-    victor_unit_id: str  # or None for draw
-    occurred_at: str
-
-
-# domain/events/resource_events.py
-@dataclass
-class GlobalTickExecutedEvent:
-    """
-    Emitted every 10 seconds when resources are generated.
-
-    This is a system-level event that triggers resource
-    generation for all players and cities.
-
-    Consumers might:
-    - Generate resources for each city
-    - Progress production queues
-    - Apply upkeep costs
-    """
-    tick_number: int
-    executed_at: str
-
-
-@dataclass
-class ResourcesGeneratedEvent:
-    """
-    Emitted when a player receives resources from the global tick.
-
-    Consumers might:
-    - Update player dashboard
-    - Check for resource milestones
-    - Update analytics
-    """
-    player_id: str
-    gold_generated: int
-    food_generated: int
-    science_generated: int
-    generated_at: str
-```
-
-### Event Handling Patterns
-
-#### Pattern 1: Single Event, Single Handler (Most Common)
-
-Most events should have a single, focused consumer.
-
-```python
-# application/event_handlers/unit_arrived_event_handler.py
-class UnitArrivedEventHandler:
-    """
-    Handles UnitArrivedEvent.
-    Updates fog of war and checks for combat.
-    """
-
-    def __init__(
-        self,
-        fog_of_war_updater: FogOfWarUpdater,
-        combat_checker: CombatChecker,
-        unit_repository: UnitRepository,
-        world_repository: WorldRepository,
-        unit_of_work: UnitOfWork
-    ):
-        self.__fog_of_war_updater = fog_of_war_updater
-        self.__combat_checker = combat_checker
-        self.__unit_repository = unit_repository
-        self.__world_repository = world_repository
-        self.__unit_of_work = unit_of_work
-
-    def handle(self, event: UnitArrivedEvent) -> None:
-        """Processes unit arrival."""
-        unit = self.__unit_repository.find_or_fail_by_id(event.unit_id)
-        world = self.__world_repository.get_world()
-
-        # Reveal fog of war around new location
-        coordinates = Coordinates(event.x, event.y)
-        tiles_to_reveal = self.__fog_of_war_updater.calculate_visible_tiles(
-            coordinates=coordinates,
-            vision_range=unit.vision_range()
-        )
-
-        for tile_coords in tiles_to_reveal:
-            world.reveal_tile_for_player(tile_coords, unit.owner_id())
-
-        # Check for combat
-        combat_result = self.__combat_checker.check_for_combat(
-            unit=unit,
-            location=coordinates
-        )
-
-        with self.__unit_of_work():
-            self.__world_repository.save(world)
-            if combat_result:
-                # Combat domain service records combat events
-                self.__unit_repository.save(combat_result.attacker)
-                self.__unit_repository.save(combat_result.defender)
-```
-
-#### Pattern 2: Async Command Pattern with "...Requested" Events
-
-For fire-and-forget operations that need to happen asynchronously.
-
-```python
-# domain/events/notification_events.py
-@dataclass
-class PlayerNotificationRequestedEvent:
-    """
-    Pseudo-command event requesting a notification be sent.
-    This is a bridge pattern until we have async command bus.
-
-    MUST have exactly one consumer.
-    """
-    player_id: str
-    notification_type: str  # e.g., "city_founded", "unit_attacked"
-    message: str
-    data: dict  # Additional context
-
-
-# application/event_handlers/player_notification_requested_handler.py
-class PlayerNotificationRequestedEventHandler:
-    """
-    THE ONLY consumer of PlayerNotificationRequestedEvent.
-    Acts as async command handler.
-    """
-
-    def handle(self, event: PlayerNotificationRequestedEvent) -> None:
-        """Sends notification to player via websocket or push notification."""
-        # This may involve calling external services
-        # Does NOT need to be in a transaction
-        ...
-```
-
----
-
-## Command and Query Separation (CQRS)
-
-Primordia strictly separates **Commands** (write operations) from **Queries** (read operations).
-
-### Commands
-
-Commands represent **intent to change state**. They are imperatively named and contain all data needed to perform the action.
-
-**Characteristics:**
-- Imperative naming: `FoundCityCommand`, `MoveUnitCommand`, `ResearchTechnologyCommand`
-- Contain only JSON-serializable primitives
-- Processed by Command Handlers
-- May produce side effects (write to database, publish events)
-- Do NOT return data (void return type)
-- Execute within a transaction
-
-**Example:**
-```python
-@dataclass
-class StartProductionCommand:
-    """Command to add an item to a city's production queue."""
-    player_id: str
-    city_id: str
-    item_type: str  # "granary", "warrior", etc.
-    estimated_completion_time: str  # ISO-8601
-
-
-class StartProductionCommandHandler:
-    def handle(self, command: StartProductionCommand) -> None:
-        city = self.__city_repository.find_or_fail_by_id(command.city_id)
-
-        # Validate ownership
-        if city.owner_id() != command.player_id:
-            raise UnauthorizedActionError()
-
-        # Domain logic
-        production_item = ProductionItem(
-            item_type=command.item_type,
-            completion_time=datetime.fromisoformat(
-                command.estimated_completion_time
-            )
-        )
-        city.add_production_item(production_item)
-
+```elixir
+# lib/primordia/game/servers/city_server.ex
+defmodule Primordia.Game.Servers.CityServer do
+  @moduledoc """
+  GenServer managing a single city's state and lifecycle.
+  """
+
+  use GenServer
+  require Logger
+
+  alias Primordia.Game.City
+  alias Primordia.Repo
+
+  # Client API
+
+  def start_link({city_id, player_id}) do
+    GenServer.start_link(__MODULE__, {city_id, player_id}, name: via_tuple(city_id))
+  end
+
+  def start_production(city_id, building_type) do
+    GenServer.call(via_tuple(city_id), {:start_production, building_type})
+  end
+
+  def get_state(city_id) do
+    GenServer.call(via_tuple(city_id), :get_state)
+  end
+
+  def process_tick(city_id) do
+    GenServer.cast(via_tuple(city_id), :process_tick)
+  end
+
+  # Server Callbacks
+
+  @impl true
+  def init({city_id, player_id}) do
+    # Load from database
+    city = load_city_from_db(city_id)
+
+    state = %{
+      city: city,
+      player_id: player_id
+    }
+
+    # Resume any in-progress production
+    state = maybe_schedule_production(state)
+
+    Logger.info("CityServer started for #{city.name} (#{city_id})")
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_call({:start_production, building_type}, _from, state) do
+    now = DateTime.utc_now()
+
+    case City.start_production(state.city, now) do
+      {:ok, updated_city, duration_ms} ->
+        # Schedule completion
+        Process.send_after(self(), :complete_production, duration_ms)
+
+        # Persist to database
+        persist_city(updated_city)
+
+        # Broadcast event
+        broadcast_production_started(state.player_id, updated_city, duration_ms)
+
+        {:reply, {:ok, updated_city}, %{state | city: updated_city}}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_call(:get_state, _from, state) do
+    {:reply, state.city, state}
+  end
+
+  @impl true
+  def handle_cast(:process_tick, state) do
+    food_generated = calculate_food_generation(state.city)
+    {updated_city, grew?} = City.apply_food_tick(state.city, food_generated)
+
+    # Persist
+    persist_city(updated_city)
+
+    # Broadcast growth event if population increased
+    if grew? do
+      broadcast_city_grew(state.player_id, updated_city)
+    end
+
+    {:noreply, %{state | city: updated_city}}
+  end
+
+  @impl true
+  def handle_info(:complete_production, state) do
+    case City.complete_production(state.city) do
+      {:ok, updated_city, completed_building} ->
         # Persist
-        with self.__unit_of_work():
-            self.__city_repository.save(city)
-            self.__event_bus.bulk_publish(city.pull_events())
+        persist_city(updated_city)
+
+        # Broadcast completion
+        broadcast_production_complete(state.player_id, updated_city, completed_building)
+
+        Logger.info("#{state.city.name} completed #{completed_building}")
+        {:noreply, %{state | city: updated_city}}
+
+      {:error, reason} ->
+        Logger.error("Failed to complete production: #{reason}")
+        {:noreply, state}
+    end
+  end
+
+  # Private Functions
+
+  defp via_tuple(city_id) do
+    {:via, Registry, {Primordia.GameRegistry, {:city, city_id}}}
+  end
+
+  defp load_city_from_db(city_id) do
+    # Load from Ecto and convert to domain struct
+    db_city = Repo.get!(Primordia.Game.Schemas.City, city_id)
+    City.new(db_city.id, db_city.name, db_city.player_id, db_city.x, db_city.y)
+    |> Map.merge(%{
+      population: db_city.population,
+      food_stores: db_city.food_stores,
+      buildings: db_city.buildings || [],
+      production_item: db_city.production_item,
+      production_completes_at: db_city.production_completes_at
+    })
+  end
+
+  defp persist_city(%City{} = city) do
+    Primordia.Game.update_city_from_domain(city)
+  end
+
+  defp maybe_schedule_production(%{city: %{production_completes_at: nil}} = state) do
+    state
+  end
+
+  defp maybe_schedule_production(%{city: city} = state) do
+    remaining_ms = DateTime.diff(city.production_completes_at, DateTime.utc_now(), :millisecond)
+
+    if remaining_ms > 0 do
+      Process.send_after(self(), :complete_production, remaining_ms)
+    else
+      # Past due - complete immediately
+      send(self(), :complete_production)
+    end
+
+    state
+  end
+
+  defp calculate_food_generation(%City{population: pop, buildings: buildings}) do
+    base_food = pop * 2
+    granary_bonus = if "granary" in buildings, do: pop, else: 0
+    base_food + granary_bonus
+  end
+
+  defp broadcast_production_started(player_id, city, duration_ms) do
+    Phoenix.PubSub.broadcast(
+      Primordia.PubSub,
+      "player:#{player_id}",
+      {:production_started, %{
+        city_id: city.id,
+        item: city.production_item,
+        completes_at: city.production_completes_at,
+        duration_ms: duration_ms
+      }}
+    )
+  end
+
+  defp broadcast_production_complete(player_id, city, building) do
+    Phoenix.PubSub.broadcast(
+      Primordia.PubSub,
+      "player:#{player_id}",
+      {:production_complete, %{
+        city_id: city.id,
+        building: building
+      }}
+    )
+  end
+
+  defp broadcast_city_grew(player_id, city) do
+    Phoenix.PubSub.broadcast(
+      Primordia.PubSub,
+      "player:#{player_id}",
+      {:city_grew, %{
+        city_id: city.id,
+        name: city.name,
+        new_population: city.population
+      }}
+    )
+  end
+end
 ```
 
-### Queries
+### Infrastructure Layer (`lib/primordia_web/`)
 
-Queries represent **requests for data**. They are interrogatively named and return view models optimized for the client.
+**Purpose:** HTTP/WebSocket interfaces and database implementations.
 
-**Characteristics:**
-- Interrogative naming: `GetPlayerCitiesQuery`, `GetVisibleTilesQuery`
-- Contain only JSON-serializable primitives
-- Processed by Query Handlers
-- Do NOT produce side effects
-- Do NOT modify state
-- Return view models (NOT domain entities)
-- Do NOT execute within a transaction
+**Responsibilities:**
+- Phoenix Channels for WebSocket communication
+- REST Controllers for non-realtime operations
+- Ecto Schemas for database mapping
+- Authentication plugs
 
-**Use Finders, NOT Repositories** for queries.
+**What belongs here:**
+- Channels: `GameChannel`, `UserSocket`
+- Controllers: `AuthController`, `FallbackController`
+- JSON Views: `CityJSON`, `UnitJSON`
+- Ecto Schemas: `Primordia.Game.Schemas.City`, etc.
 
 **Example:**
-```python
-# application/queries/get_player_cities_query.py
-@dataclass
-class GetPlayerCitiesQuery:
-    """Query to retrieve all cities owned by a player."""
-    player_id: str
+```elixir
+# lib/primordia_web/channels/game_channel.ex
+defmodule PrimordiaWeb.GameChannel do
+  @moduledoc """
+  Phoenix Channel for real-time game communication.
+  """
 
+  use PrimordiaWeb, :channel
 
-# application/finders/player_cities_finder.py
-class PlayerCitiesFinder(ABC):
-    """
-    Finder for retrieving player cities.
-    Single responsibility: find cities by player.
-    """
+  alias Primordia.Game
+  alias Primordia.Game.Servers.{PlayerServer, CityServer}
 
-    @abstractmethod
-    def find(self, player_id: str) -> list["CityViewModel"]:
-        """Returns view models, NOT domain entities."""
-        pass
+  @impl true
+  def join("game:player:" <> player_id, _params, socket) do
+    if socket.assigns.player_id == player_id do
+      # Subscribe to player's PubSub topic
+      Phoenix.PubSub.subscribe(Primordia.PubSub, "player:#{player_id}")
 
+      # Ensure PlayerServer is running
+      Game.ensure_player_server_started(player_id)
 
-# infrastructure/finders/postgres_player_cities_finder.py
-class PostgresPlayerCitiesFinder(PlayerCitiesFinder):
-    """Concrete implementation using PostgreSQL."""
+      # Send current state
+      state = PlayerServer.get_full_state(player_id)
+      {:ok, %{state: state}, socket}
+    else
+      {:error, %{reason: "unauthorized"}}
+    end
+  end
 
-    def find(self, player_id: str) -> list[CityViewModel]:
-        # Optimized query, possibly with joins
-        cities = CityModel.objects.filter(owner_id=player_id).select_related(...)
+  @impl true
+  def handle_in("found_city", %{"settler_id" => settler_id, "name" => name}, socket) do
+    player_id = socket.assigns.player_id
 
-        return [
-            CityViewModel(
-                city_id=str(city.id),
-                name=city.name,
-                x=city.x,
-                y=city.y,
-                population=city.population,
-                production_queue=[...],
-                food_per_turn=city.calculate_food_per_turn()
-            )
-            for city in cities
-        ]
+    case Game.found_city(player_id, settler_id, name) do
+      {:ok, city} ->
+        broadcast!(socket, "city_founded", %{
+          city: CityJSON.show(city)
+        })
+        {:reply, {:ok, %{city_id: city.id}}, socket}
 
+      {:error, reason} ->
+        {:reply, {:error, %{reason: to_string(reason)}}, socket}
+    end
+  end
 
-# application/handlers/get_player_cities_query_handler.py
-@dataclass
-class CityViewModel:
-    """
-    View model optimized for displaying city list.
-    Contains denormalized/calculated data.
-    """
-    city_id: str
-    name: str
-    x: int
-    y: int
-    population: int
-    production_queue: list[dict]
-    food_per_turn: int
+  @impl true
+  def handle_in("start_production", %{"city_id" => city_id, "building" => building}, socket) do
+    case CityServer.start_production(city_id, building) do
+      {:ok, city} ->
+        {:reply, {:ok, %{completes_at: city.production_completes_at}}, socket}
 
+      {:error, reason} ->
+        {:reply, {:error, %{reason: to_string(reason)}}, socket}
+    end
+  end
 
-class GetPlayerCitiesQueryHandler:
-    def __init__(self, player_cities_finder: PlayerCitiesFinder):
-        self.__finder = player_cities_finder
+  @impl true
+  def handle_in("move_unit", %{"unit_id" => unit_id, "to" => %{"x" => x, "y" => y}}, socket) do
+    player_id = socket.assigns.player_id
 
-    def handle(self, query: GetPlayerCitiesQuery) -> list[CityViewModel]:
-        """
-        Returns view models directly.
-        No transaction needed - this is read-only.
-        """
-        return self.__finder.find(query.player_id)
-```
+    case Game.move_unit(player_id, unit_id, x, y) do
+      {:ok, unit} ->
+        {:reply, {:ok, %{arrival_time: unit.arrival_time}}, socket}
 
-### Critical Rule: Commands and Queries Must Remain Independent
+      {:error, reason} ->
+        {:reply, {:error, %{reason: to_string(reason)}}, socket}
+    end
+  end
 
-❌ **NEVER** execute a query inside a command handler
-❌ **NEVER** use a query result to build a command
+  # Handle PubSub messages and forward to client
+  @impl true
+  def handle_info({:production_started, payload}, socket) do
+    push(socket, "production_started", payload)
+    {:noreply, socket}
+  end
 
-All validation must happen inside the command handler's transaction using repositories to fetch domain entities.
+  @impl true
+  def handle_info({:production_complete, payload}, socket) do
+    push(socket, "production_complete", payload)
+    {:noreply, socket}
+  end
 
-```python
-# ❌ WRONG: Using query result to validate command
-class MoveUnitCommandHandler:
-    def handle(self, command: MoveUnitCommand) -> None:
-        # ❌ BAD: Using finder (query-side) in command handler
-        unit_view = self.__unit_finder.find_by_id(command.unit_id)
-        if unit_view.is_moving:
-            raise UnitAlreadyMovingError()
+  @impl true
+  def handle_info({:city_grew, payload}, socket) do
+    push(socket, "city_grew", payload)
+    {:noreply, socket}
+  end
 
-        # This creates a race condition!
-        # The unit's state might have changed between the query and now
+  @impl true
+  def handle_info({:resources_tick, payload}, socket) do
+    push(socket, "resources_tick", payload)
+    {:noreply, socket}
+  end
 
-
-# ✅ CORRECT: Fetch domain entity from repository
-class MoveUnitCommandHandler:
-    def handle(self, command: MoveUnitCommand) -> None:
-        # ✅ GOOD: Fetch aggregate root
-        with self.__unit_of_work():
-            unit = self.__unit_repository.find_or_fail_by_id(command.unit_id)
-
-            # Domain entity enforces invariants atomically
-            unit.move_to(
-                destination=Coordinates(command.to_x, command.to_y),
-                movement_calculator=self.__movement_calculator
-            )
-
-            self.__unit_repository.save(unit)
-            self.__event_bus.bulk_publish(unit.pull_events())
+  @impl true
+  def handle_info({:unit_moved, payload}, socket) do
+    push(socket, "unit_moved", payload)
+    {:noreply, socket}
+  end
+end
 ```
 
 ---
 
-## Transaction Management
+## Process Architecture
 
-All database transactions **must be managed in the application layer** using the `UnitOfWork` pattern.
+### Supervision Tree
 
-### Rules:
-
-1. **Transactions live in command handlers only**
-2. **Domain services never manage transactions**
-3. **Infrastructure layer (controllers) never manage transactions**
-4. **All side effects happen inside the transaction block**
-
-### Pattern:
-
-```python
-class SomeCommandHandler:
-    def __init__(
-        self,
-        repository: SomeRepository,
-        event_bus: EventBus,
-        unit_of_work: UnitOfWork
-    ):
-        self.__repository = repository
-        self.__event_bus = event_bus
-        self.__unit_of_work = unit_of_work
-
-    def handle(self, command: SomeCommand) -> None:
-        # 1. Fetch aggregates (outside transaction)
-        entity = self.__repository.find_or_fail_by_id(command.entity_id)
-
-        # 2. Execute domain logic (outside transaction)
-        entity.do_something()
-
-        # 3. Persist and publish in single transaction
-        with self.__unit_of_work():
-            self.__repository.save(entity)
-            self.__event_bus.bulk_publish(entity.pull_events())
+```
+Primordia.Application
+├── Primordia.Repo
+├── Phoenix.PubSub (name: Primordia.PubSub)
+├── PrimordiaWeb.Endpoint
+├── {Registry, name: Primordia.GameRegistry}
+├── Primordia.Game.TickServer
+├── Primordia.Game.WorldServer
+└── Primordia.Game.GameSupervisor (DynamicSupervisor)
+    ├── Primordia.Game.Servers.PlayerServer (Player 1)
+    │   └── (manages cities and units in state)
+    ├── Primordia.Game.Servers.PlayerServer (Player 2)
+    └── ...
 ```
 
-### Why This Matters for Primordia:
+### Process Registry
 
-Given the real-time nature of the game, we need **perfect concurrency control**. For example:
+Use `Registry` for named process lookup:
 
-- Two players move units to the same tile simultaneously
-- The first to reach the tile should occupy it
-- The second should initiate combat
+```elixir
+# lib/primordia/game/registry.ex
+defmodule Primordia.Game.Registry do
+  @moduledoc """
+  Helpers for registering and looking up game processes.
+  """
 
-Without proper transactional boundaries, we could end up with:
-- Both units occupying the same tile
-- Neither unit occupying the tile
-- Duplicated combat events
+  def via_player(player_id) do
+    {:via, Registry, {Primordia.GameRegistry, {:player, player_id}}}
+  end
 
-By wrapping all persistence and event publication in a single transaction, we ensure **atomic updates** and **consistent event ordering**.
+  def via_city(city_id) do
+    {:via, Registry, {Primordia.GameRegistry, {:city, city_id}}}
+  end
+
+  def via_unit(unit_id) do
+    {:via, Registry, {Primordia.GameRegistry, {:unit, unit_id}}}
+  end
+
+  def lookup_player(player_id) do
+    case Registry.lookup(Primordia.GameRegistry, {:player, player_id}) do
+      [{pid, _}] -> {:ok, pid}
+      [] -> {:error, :not_found}
+    end
+  end
+end
+```
+
+### Starting Processes
+
+```elixir
+# lib/primordia/game/game_supervisor.ex
+defmodule Primordia.Game.GameSupervisor do
+  use DynamicSupervisor
+
+  def start_link(init_arg) do
+    DynamicSupervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_init_arg) do
+    DynamicSupervisor.init(strategy: :one_for_one)
+  end
+
+  def start_player_server(player_id) do
+    spec = {Primordia.Game.Servers.PlayerServer, player_id}
+    DynamicSupervisor.start_child(__MODULE__, spec)
+  end
+
+  def ensure_player_server(player_id) do
+    case Registry.lookup(Primordia.GameRegistry, {:player, player_id}) do
+      [{pid, _}] -> {:ok, pid}
+      [] -> start_player_server(player_id)
+    end
+  end
+end
+```
 
 ---
 
-## Asynchronous Processing
+## Domain Logic & Pure Functions
 
-Primordia's core feature is **continuous real-time evolution**. This requires robust asynchronous processing.
+### Separation of Concerns
 
-### Key Async Workflows:
+Domain logic should be **pure functions** - given the same inputs, they always produce the same outputs with no side effects.
 
-1. **Global Tick** (every 10 seconds) - resource generation
-2. **Unit Movement Completion** - when arrival time is reached
-3. **Production Completion** - when building/unit finishes
-4. **Combat Resolution** - when units meet
+```elixir
+# lib/primordia/game/combat.ex
+defmodule Primordia.Game.Combat do
+  @moduledoc """
+  Pure combat resolution logic.
+  No side effects - just calculations.
+  """
 
-### Pattern: Scheduled Event Processing
+  alias Primordia.Game.{Unit, Tile}
 
-```python
-# application/schedulers/global_tick_scheduler.py
-class GlobalTickScheduler:
-    """
-    Runs every 10 seconds.
-    Publishes GlobalTickExecutedEvent.
-    """
+  @type combat_result :: %{
+    attacker_damage: non_neg_integer(),
+    defender_damage: non_neg_integer(),
+    attacker_survives: boolean(),
+    defender_survives: boolean(),
+    winner: :attacker | :defender | :draw
+  }
 
-    def __init__(
-        self,
-        event_bus: EventBus,
-        logger: Logger
-    ):
-        self.__event_bus = event_bus
-        self.__logger = logger
-        self.__tick_number = 0
+  @spec resolve(Unit.t(), Unit.t(), Tile.t()) :: combat_result()
+  def resolve(%Unit{} = attacker, %Unit{} = defender, %Tile{} = terrain) do
+    terrain_bonus = terrain_defense_multiplier(terrain.terrain_type)
 
-    def execute_tick(self) -> None:
-        """Called every 10 seconds by scheduler (e.g., Celery beat)."""
-        self.__tick_number += 1
+    # Calculate effective combat values
+    attack_power = attacker.attack * (0.5 + :rand.uniform() * 0.5)
+    defense_power = defender.defense * terrain_bonus * (0.5 + :rand.uniform() * 0.5)
 
-        event = GlobalTickExecutedEvent(
-            tick_number=self.__tick_number,
-            executed_at=datetime.utcnow().isoformat()
-        )
+    # Calculate damage
+    damage_to_defender = max(0, round(attack_power - defense_power * 0.3))
+    damage_to_attacker = max(0, round(defense_power * 0.5 - attack_power * 0.2))
 
-        self.__event_bus.publish(event)
-        self.__logger.info(f"Global tick #{self.__tick_number} executed")
+    attacker_survives = attacker.health > damage_to_attacker
+    defender_survives = defender.health > damage_to_defender
 
+    winner = cond do
+      not defender_survives and attacker_survives -> :attacker
+      not attacker_survives and defender_survives -> :defender
+      not attacker_survives and not defender_survives -> :draw
+      true -> :draw
+    end
 
-# application/event_handlers/global_tick_executed_event_handler.py
-class GlobalTickExecutedEventHandler:
-    """
-    Responds to GlobalTickExecutedEvent.
-    Generates resources for all players.
-    """
+    %{
+      attacker_damage: damage_to_attacker,
+      defender_damage: damage_to_defender,
+      attacker_survives: attacker_survives,
+      defender_survives: defender_survives,
+      winner: winner
+    }
+  end
 
-    def __init__(
-        self,
-        player_repository: PlayerRepository,
-        city_repository: CityRepository,
-        resource_generator: ResourceGenerator,
-        event_bus: EventBus,
-        unit_of_work: UnitOfWork
-    ):
-        self.__player_repository = player_repository
-        self.__city_repository = city_repository
-        self.__resource_generator = resource_generator
-        self.__event_bus = event_bus
-        self.__unit_of_work = unit_of_work
+  @spec apply_damage(Unit.t(), non_neg_integer()) :: Unit.t()
+  def apply_damage(%Unit{health: health} = unit, damage) do
+    %{unit | health: max(0, health - damage)}
+  end
 
-    def handle(self, event: GlobalTickExecutedEvent) -> None:
-        """Generates resources for all active players."""
-        players = self.__player_repository.find_all_active()
-
-        for player in players:
-            cities = self.__city_repository.find_by_owner(player.player_id())
-
-            # Domain service calculates resources
-            resources = self.__resource_generator.calculate_tick_resources(
-                player=player,
-                cities=cities
-            )
-
-            player.add_gold(resources.gold)
-            player.add_science(resources.science)
-
-            for city, food in resources.city_food.items():
-                city.apply_food_growth(food)
-
-            # Persist changes
-            with self.__unit_of_work():
-                self.__player_repository.save(player)
-                for city in cities:
-                    self.__city_repository.save(city)
-
-                # Publish events
-                self.__event_bus.bulk_publish([
-                    ResourcesGeneratedEvent(
-                        player_id=player.player_id(),
-                        gold_generated=resources.gold,
-                        food_generated=sum(resources.city_food.values()),
-                        science_generated=resources.science,
-                        generated_at=event.executed_at
-                    )
-                ])
+  defp terrain_defense_multiplier(:plains), do: 1.0
+  defp terrain_defense_multiplier(:forest), do: 1.25
+  defp terrain_defense_multiplier(:mountains), do: 1.5
+  defp terrain_defense_multiplier(:water), do: 0.5
+  defp terrain_defense_multiplier(_), do: 1.0
+end
 ```
 
-### Pattern: Time-Based Event Processing
+### Why Pure Functions Matter
 
-For events that should happen at a specific time (unit arrivals, production completion):
+1. **Testability** - Easy to unit test without mocking
+2. **Predictability** - No hidden state or side effects
+3. **Composability** - Functions can be combined freely
+4. **Process Safety** - Safe to call from any process
 
-```python
-# application/schedulers/timed_events_processor.py
-class TimedEventsProcessor:
-    """
-    Runs frequently (e.g., every 1 second).
-    Checks for units/production that have completed.
-    """
+---
 
-    def __init__(
-        self,
-        unit_repository: UnitRepository,
-        city_repository: CityRepository,
-        event_bus: EventBus,
-        unit_of_work: UnitOfWork
-    ):
-        self.__unit_repository = unit_repository
-        self.__city_repository = city_repository
-        self.__event_bus = event_bus
-        self.__unit_of_work = unit_of_work
+## State Management with GenServers
 
-    def process_pending_arrivals(self) -> None:
-        """Completes unit movements that have reached arrival time."""
-        now = datetime.utcnow()
+### GenServer Best Practices
 
-        # Find units that should have arrived
-        moving_units = self.__unit_repository.find_units_arriving_before(now)
+#### 1. Keep State Minimal
 
-        for unit in moving_units:
-            unit.complete_movement()
+Store only what's needed; derive the rest:
 
-            with self.__unit_of_work():
-                self.__unit_repository.save(unit)
-                self.__event_bus.bulk_publish(unit.pull_events())
+```elixir
+# Good - minimal state
+defmodule PlayerServer do
+  def init(player_id) do
+    {:ok, %{
+      player: load_player(player_id),
+      cities: load_cities(player_id),
+      units: load_units(player_id)
+    }}
+  end
+end
 
-    def process_production_completions(self) -> None:
-        """Completes production items that have finished."""
-        now = datetime.utcnow()
+# Avoid - derived data in state
+# Don't store calculated values that can be derived
+```
 
-        cities = self.__city_repository.find_cities_with_production_completing_before(now)
+#### 2. Handle Calls vs Casts
 
-        for city in cities:
-            # Domain logic handles completion
-            city.complete_current_production()
+- Use `call` when you need a response
+- Use `cast` for fire-and-forget operations
+- Use `info` for internal messages and timers
 
-            with self.__unit_of_work():
-                self.__city_repository.save(city)
-                self.__event_bus.bulk_publish(city.pull_events())
+```elixir
+# Call - client needs response
+def handle_call(:get_state, _from, state) do
+  {:reply, state, state}
+end
+
+# Cast - fire and forget
+def handle_cast(:process_tick, state) do
+  new_state = do_tick(state)
+  {:noreply, new_state}
+end
+
+# Info - internal/scheduled messages
+def handle_info(:complete_production, state) do
+  new_state = complete_current_production(state)
+  {:noreply, new_state}
+end
+```
+
+#### 3. Delegate to Pure Functions
+
+GenServer callbacks should be thin - delegate to domain modules:
+
+```elixir
+def handle_call({:move_unit, dest_x, dest_y}, _from, state) do
+  # Delegate to pure domain function
+  case Movement.calculate_path(state.unit, dest_x, dest_y, state.world) do
+    {:ok, path, arrival_time} ->
+      # Update state
+      updated_unit = %{state.unit |
+        path: path,
+        arrival_time: arrival_time
+      }
+
+      # Schedule arrival
+      ms_until_arrival = DateTime.diff(arrival_time, DateTime.utc_now(), :millisecond)
+      Process.send_after(self(), :arrive, ms_until_arrival)
+
+      # Persist
+      persist_unit(updated_unit)
+
+      {:reply, {:ok, updated_unit}, %{state | unit: updated_unit}}
+
+    {:error, reason} ->
+      {:reply, {:error, reason}, state}
+  end
+end
+```
+
+---
+
+## Event Broadcasting with PubSub
+
+### Topic Design
+
+```elixir
+# Player-specific events
+"player:#{player_id}"
+
+# World region events (for future scaling)
+"world:region:#{region_id}"
+
+# Global events
+"game:global"
+```
+
+### Publishing Events
+
+```elixir
+defmodule Primordia.Game.Events do
+  @moduledoc """
+  Centralized event broadcasting.
+  """
+
+  def broadcast_to_player(player_id, event_type, payload) do
+    Phoenix.PubSub.broadcast(
+      Primordia.PubSub,
+      "player:#{player_id}",
+      {event_type, payload}
+    )
+  end
+
+  def city_founded(player_id, city) do
+    broadcast_to_player(player_id, :city_founded, %{
+      city_id: city.id,
+      name: city.name,
+      x: city.x,
+      y: city.y
+    })
+  end
+
+  def unit_arrived(player_id, unit) do
+    broadcast_to_player(player_id, :unit_arrived, %{
+      unit_id: unit.id,
+      x: unit.x,
+      y: unit.y
+    })
+  end
+
+  def combat_occurred(attacker_player_id, defender_player_id, result) do
+    payload = %{
+      attacker_id: result.attacker_id,
+      defender_id: result.defender_id,
+      winner: result.winner,
+      attacker_damage: result.attacker_damage,
+      defender_damage: result.defender_damage
+    }
+
+    broadcast_to_player(attacker_player_id, :combat_result, payload)
+    broadcast_to_player(defender_player_id, :combat_result, payload)
+  end
+end
+```
+
+### Subscribing in Channels
+
+```elixir
+def join("game:player:" <> player_id, _params, socket) do
+  # Subscribe to player's topic
+  Phoenix.PubSub.subscribe(Primordia.PubSub, "player:#{player_id}")
+  {:ok, socket}
+end
+
+# Forward PubSub messages to WebSocket
+def handle_info({event_type, payload}, socket) do
+  push(socket, to_string(event_type), payload)
+  {:noreply, socket}
+end
+```
+
+---
+
+## Persistence with Ecto
+
+### Schema vs Domain Struct
+
+Keep Ecto schemas separate from domain structs:
+
+```elixir
+# lib/primordia/game/schemas/city.ex - Ecto Schema (Infrastructure)
+defmodule Primordia.Game.Schemas.City do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @primary_key {:id, :binary_id, autogenerate: true}
+  schema "cities" do
+    field :name, :string
+    field :x, :integer
+    field :y, :integer
+    field :population, :integer, default: 1
+    field :food_stores, :integer, default: 0
+    field :buildings, {:array, :string}, default: []
+    field :production_item, :string
+    field :production_completes_at, :utc_datetime
+
+    belongs_to :player, Primordia.Game.Schemas.Player, type: :binary_id
+
+    timestamps()
+  end
+
+  def changeset(city, attrs) do
+    city
+    |> cast(attrs, [:name, :x, :y, :population, :food_stores, :buildings,
+                    :production_item, :production_completes_at, :player_id])
+    |> validate_required([:name, :x, :y, :player_id])
+    |> validate_length(:name, min: 1, max: 50)
+  end
+end
+
+# lib/primordia/game/city.ex - Domain Struct (Domain)
+defmodule Primordia.Game.City do
+  # Pure domain logic, no Ecto
+  defstruct [:id, :name, :player_id, :x, :y, ...]
+end
+```
+
+### Context Module
+
+```elixir
+# lib/primordia/game.ex
+defmodule Primordia.Game do
+  @moduledoc """
+  The Game context - public API for game operations.
+  """
+
+  alias Primordia.Repo
+  alias Primordia.Game.Schemas
+  alias Primordia.Game.{City, Unit, Player}
+  alias Primordia.Game.Servers.{PlayerServer, CityServer}
+  alias Primordia.Game.GameSupervisor
+
+  # --- Player Operations ---
+
+  def get_player!(player_id) do
+    Schemas.Player
+    |> Repo.get!(player_id)
+    |> schema_to_domain()
+  end
+
+  def create_player(user_id) do
+    %Schemas.Player{}
+    |> Schemas.Player.changeset(%{user_id: user_id, gold: 100, food: 50, science: 0})
+    |> Repo.insert()
+  end
+
+  # --- City Operations ---
+
+  def found_city(player_id, settler_id, city_name) do
+    # This coordinates between multiple operations
+    Repo.transaction(fn ->
+      # Get settler
+      settler = Repo.get!(Schemas.Unit, settler_id)
+
+      # Validate ownership
+      if settler.player_id != player_id do
+        Repo.rollback(:not_owner)
+      end
+
+      # Validate settler type
+      if settler.unit_type != "settler" do
+        Repo.rollback(:not_settler)
+      end
+
+      # Create city
+      {:ok, city} = %Schemas.City{}
+      |> Schemas.City.changeset(%{
+        name: city_name,
+        player_id: player_id,
+        x: settler.x,
+        y: settler.y
+      })
+      |> Repo.insert()
+
+      # Delete settler
+      Repo.delete!(settler)
+
+      # Start CityServer
+      {:ok, _pid} = GameSupervisor.start_city_server(city.id, player_id)
+
+      # Broadcast event
+      Events.city_founded(player_id, city)
+
+      city
+    end)
+  end
+
+  def update_city_from_domain(%City{} = city) do
+    Schemas.City
+    |> Repo.get!(city.id)
+    |> Schemas.City.changeset(%{
+      population: city.population,
+      food_stores: city.food_stores,
+      buildings: city.buildings,
+      production_item: city.production_item,
+      production_completes_at: city.production_completes_at
+    })
+    |> Repo.update()
+  end
+
+  # --- Unit Operations ---
+
+  def move_unit(player_id, unit_id, dest_x, dest_y) do
+    # Delegate to UnitServer
+    case Registry.lookup(Primordia.GameRegistry, {:unit, unit_id}) do
+      [{pid, _}] ->
+        GenServer.call(pid, {:move_to, dest_x, dest_y})
+      [] ->
+        {:error, :unit_not_found}
+    end
+  end
+
+  # --- Process Management ---
+
+  def ensure_player_server_started(player_id) do
+    GameSupervisor.ensure_player_server(player_id)
+  end
+
+  # --- Conversion Helpers ---
+
+  defp schema_to_domain(%Schemas.City{} = schema) do
+    %City{
+      id: schema.id,
+      name: schema.name,
+      player_id: schema.player_id,
+      x: schema.x,
+      y: schema.y,
+      population: schema.population,
+      food_stores: schema.food_stores,
+      buildings: schema.buildings || [],
+      production_item: schema.production_item,
+      production_completes_at: schema.production_completes_at
+    }
+  end
+end
+```
+
+### Transaction Patterns
+
+Use `Ecto.Multi` for complex operations:
+
+```elixir
+def found_city(player_id, settler_id, city_name) do
+  Multi.new()
+  |> Multi.run(:settler, fn repo, _ ->
+    case repo.get(Schemas.Unit, settler_id) do
+      nil -> {:error, :settler_not_found}
+      settler -> {:ok, settler}
+    end
+  end)
+  |> Multi.run(:validate, fn _repo, %{settler: settler} ->
+    cond do
+      settler.player_id != player_id -> {:error, :not_owner}
+      settler.unit_type != "settler" -> {:error, :not_settler}
+      true -> {:ok, :valid}
+    end
+  end)
+  |> Multi.insert(:city, fn %{settler: settler} ->
+    Schemas.City.changeset(%Schemas.City{}, %{
+      name: city_name,
+      player_id: player_id,
+      x: settler.x,
+      y: settler.y
+    })
+  end)
+  |> Multi.delete(:delete_settler, fn %{settler: settler} -> settler end)
+  |> Repo.transaction()
+  |> case do
+    {:ok, %{city: city}} -> {:ok, city}
+    {:error, _step, reason, _changes} -> {:error, reason}
+  end
+end
 ```
 
 ---
@@ -1209,407 +1071,437 @@ class TimedEventsProcessor:
 
 ```
 primordia/
-├── domain/
-│   ├── entities/
-│   │   ├── __init__.py
-│   │   ├── aggregate_root.py
-│   │   ├── player.py
-│   │   ├── city.py
-│   │   ├── unit.py
-│   │   ├── tile.py
-│   │   └── world.py
-│   ├── value_objects/
-│   │   ├── __init__.py
-│   │   ├── coordinates.py
-│   │   ├── tile_type.py
-│   │   ├── unit_type.py
-│   │   └── resource_amount.py
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── city_founder.py
-│   │   ├── unit_mover.py
-│   │   ├── combat_resolver.py
-│   │   ├── resource_generator.py
-│   │   └── movement_calculator.py
-│   ├── repositories/
-│   │   ├── __init__.py
-│   │   ├── player_repository.py
-│   │   ├── city_repository.py
-│   │   ├── unit_repository.py
-│   │   └── world_repository.py
-│   ├── events/
-│   │   ├── __init__.py
-│   │   ├── city_events.py
-│   │   ├── unit_events.py
-│   │   ├── player_events.py
-│   │   └── resource_events.py
-│   └── exceptions/
-│       ├── __init__.py
-│       ├── domain_exceptions.py
-│       └── validation_errors.py
+├── lib/
+│   ├── primordia/
+│   │   ├── application.ex           # OTP Application, supervision tree
+│   │   ├── repo.ex                  # Ecto Repo
+│   │   │
+│   │   ├── accounts/                # User authentication context
+│   │   │   ├── accounts.ex          # Context module
+│   │   │   ├── user.ex              # User schema
+│   │   │   └── guardian.ex          # JWT configuration
+│   │   │
+│   │   └── game/                    # Game context
+│   │       ├── game.ex              # Context module (public API)
+│   │       ├── events.ex            # PubSub event helpers
+│   │       │
+│   │       ├── schemas/             # Ecto schemas (persistence)
+│   │       │   ├── player.ex
+│   │       │   ├── city.ex
+│   │       │   ├── unit.ex
+│   │       │   └── tile.ex
+│   │       │
+│   │       ├── city.ex              # Domain struct + pure logic
+│   │       ├── unit.ex              # Domain struct + pure logic
+│   │       ├── player.ex            # Domain struct + pure logic
+│   │       ├── tile.ex              # Domain struct + pure logic
+│   │       │
+│   │       ├── combat.ex            # Combat resolution (pure)
+│   │       ├── movement.ex          # Pathfinding (pure)
+│   │       ├── resources.ex         # Resource calculation (pure)
+│   │       ├── fog_of_war.ex        # Vision calculation (pure)
+│   │       │
+│   │       ├── servers/             # GenServers (stateful)
+│   │       │   ├── game_supervisor.ex
+│   │       │   ├── player_server.ex
+│   │       │   ├── city_server.ex
+│   │       │   ├── unit_server.ex
+│   │       │   ├── tick_server.ex
+│   │       │   └── world_server.ex
+│   │       │
+│   │       └── registry.ex          # Process registry helpers
+│   │
+│   └── primordia_web/
+│       ├── endpoint.ex
+│       ├── router.ex
+│       │
+│       ├── channels/
+│       │   ├── user_socket.ex
+│       │   └── game_channel.ex
+│       │
+│       ├── controllers/
+│       │   ├── auth_controller.ex
+│       │   └── fallback_controller.ex
+│       │
+│       └── json/
+│           ├── city_json.ex
+│           ├── unit_json.ex
+│           └── player_json.ex
 │
-├── application/
-│   ├── commands/
-│   │   ├── __init__.py
-│   │   ├── found_city_command.py
-│   │   ├── move_unit_command.py
-│   │   ├── start_production_command.py
-│   │   └── research_technology_command.py
-│   ├── queries/
-│   │   ├── __init__.py
-│   │   ├── get_player_cities_query.py
-│   │   ├── get_visible_tiles_query.py
-│   │   └── get_unit_details_query.py
-│   ├── handlers/
-│   │   ├── command_handlers/
-│   │   │   ├── __init__.py
-│   │   │   ├── found_city_command_handler.py
-│   │   │   ├── move_unit_command_handler.py
-│   │   │   └── start_production_command_handler.py
-│   │   └── query_handlers/
-│   │       ├── __init__.py
-│   │       ├── get_player_cities_query_handler.py
-│   │       └── get_visible_tiles_query_handler.py
-│   ├── event_handlers/
-│   │   ├── __init__.py
-│   │   ├── unit_arrived_event_handler.py
-│   │   ├── global_tick_executed_event_handler.py
-│   │   └── combat_occurred_event_handler.py
-│   ├── finders/
-│   │   ├── __init__.py
-│   │   ├── player_cities_finder.py
-│   │   ├── visible_tiles_finder.py
-│   │   └── unit_details_finder.py
-│   ├── view_models/
-│   │   ├── __init__.py
-│   │   ├── city_view_model.py
-│   │   ├── unit_view_model.py
-│   │   └── tile_view_model.py
-│   └── schedulers/
-│       ├── __init__.py
-│       ├── global_tick_scheduler.py
-│       └── timed_events_processor.py
+├── priv/
+│   └── repo/
+│       ├── migrations/
+│       └── seeds.exs
 │
-├── infrastructure/
-│   ├── persistence/
-│   │   ├── __init__.py
-│   │   ├── postgres_player_repository.py
-│   │   ├── postgres_city_repository.py
-│   │   ├── postgres_unit_repository.py
-│   │   └── postgres_world_repository.py
-│   ├── finders/
-│   │   ├── __init__.py
-│   │   ├── postgres_player_cities_finder.py
-│   │   └── postgres_visible_tiles_finder.py
-│   ├── messaging/
-│   │   ├── __init__.py
-│   │   ├── rabbitmq_event_bus.py
-│   │   └── in_memory_event_bus.py
-│   ├── transaction/
-│   │   ├── __init__.py
-│   │   └── django_unit_of_work.py
-│   ├── api/
-│   │   ├── __init__.py
-│   │   ├── views/
-│   │   │   ├── found_city_view.py
-│   │   │   ├── move_unit_view.py
-│   │   │   └── get_cities_view.py
-│   │   └── serializers/
-│   │       ├── city_serializer.py
-│   │       └── unit_serializer.py
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── player_model.py
-│   │   ├── city_model.py
-│   │   ├── unit_model.py
-│   │   └── tile_model.py
-│   └── di/
-│       ├── __init__.py
-│       └── container.py  # Dependency injection container
-│
-└── tests/
-    ├── unit/
-    │   ├── domain/
-    │   │   ├── test_city.py
-    │   │   ├── test_unit.py
-    │   │   └── test_player.py
-    │   └── application/
-    │       └── test_found_city_handler.py
-    └── integration/
-        ├── test_found_city_flow.py
-        └── test_unit_movement_flow.py
+└── test/
+    ├── primordia/
+    │   ├── game/
+    │   │   ├── city_test.exs        # Domain logic tests
+    │   │   ├── combat_test.exs
+    │   │   └── movement_test.exs
+    │   └── game_test.exs            # Context tests
+    │
+    ├── primordia_web/
+    │   └── channels/
+    │       └── game_channel_test.exs
+    │
+    └── support/
+        └── fixtures.ex
 ```
 
 ---
 
 ## Testing Strategy
 
-### Unit Tests (Domain Layer)
+### Unit Tests (Domain Logic)
 
-Domain entities should be thoroughly tested in isolation.
+Test pure functions in isolation:
 
-```python
-# tests/unit/domain/test_city.py
-import pytest
-from domain.entities import City
-from domain.value_objects import Coordinates
-from domain.exceptions import ProductionQueueFullError
+```elixir
+# test/primordia/game/city_test.exs
+defmodule Primordia.Game.CityTest do
+  use ExUnit.Case, async: true
 
-class TestCity:
-    def test_found_city_records_event(self):
-        """City.found() should record CityFoundedEvent."""
-        city = City.found(
-            city_id="city-123",
-            name="Rome",
-            owner_id="player-1",
-            coordinates=Coordinates(10, 10)
-        )
+  alias Primordia.Game.City
 
-        events = city.pull_events()
-        assert len(events) == 1
-        assert events[0].city_id == "city-123"
-        assert events[0].name == "Rome"
+  describe "add_to_queue/2" do
+    test "adds building to empty queue" do
+      city = City.new("1", "Rome", "player1", 10, 10)
 
-    def test_cannot_exceed_production_queue_capacity(self):
-        """Adding more than 10 items to queue should raise error."""
-        city = City.found(...)
+      assert {:ok, updated} = City.add_to_queue(city, "granary")
+      assert updated.production_queue == ["granary"]
+    end
 
-        for i in range(10):
-            city.add_production_item(ProductionItem(f"item-{i}", ...))
+    test "returns error when queue is full" do
+      city = %City{
+        City.new("1", "Rome", "player1", 10, 10) |
+        production_queue: Enum.map(1..10, &"building#{&1}")
+      }
 
-        with pytest.raises(ProductionQueueFullError):
-            city.add_production_item(ProductionItem("item-11", ...))
+      assert {:error, :queue_full} = City.add_to_queue(city, "another")
+    end
+  end
 
-    def test_food_growth_increases_population(self):
-        """Accumulating enough food should increase population."""
-        city = City.found(...)
-        assert city.population() == 1
+  describe "apply_food_tick/2" do
+    test "accumulates food without growth" do
+      city = City.new("1", "Rome", "player1", 10, 10)
 
-        # Need 10 food to grow to population 2
-        city.apply_food_growth(5)
-        assert city.population() == 1
+      {updated, grew?} = City.apply_food_tick(city, 5)
 
-        city.apply_food_growth(5)
-        assert city.population() == 2
+      assert updated.food_stores == 5
+      assert updated.population == 1
+      assert grew? == false
+    end
+
+    test "grows population when food threshold reached" do
+      city = %City{City.new("1", "Rome", "player1", 10, 10) | food_stores: 8}
+
+      {updated, grew?} = City.apply_food_tick(city, 5)
+
+      assert updated.population == 2
+      assert updated.food_stores == 3  # 13 - 10 (threshold)
+      assert grew? == true
+    end
+  end
+end
 ```
 
-### Integration Tests (Application Layer)
+### Integration Tests (GenServers)
 
-Test complete use case flows.
+```elixir
+# test/primordia/game/servers/city_server_test.exs
+defmodule Primordia.Game.Servers.CityServerTest do
+  use Primordia.DataCase, async: false
 
-```python
-# tests/integration/test_found_city_flow.py
-import pytest
-from application.commands import FoundCityCommand
-from application.handlers import FoundCityCommandHandler
+  alias Primordia.Game.Servers.CityServer
 
-class TestFoundCityFlow:
-    def test_successful_city_founding(
-        self,
-        command_handler: FoundCityCommandHandler,
-        test_player,
-        test_settler
-    ):
-        """Complete flow of founding a city."""
-        command = FoundCityCommand(
-            player_id=test_player.player_id(),
-            settler_unit_id=test_settler.unit_id(),
-            city_name="Rome",
-            x=10,
-            y=10
-        )
+  setup do
+    # Create test player and city in database
+    {:ok, player} = Primordia.Game.create_player(user_id)
+    {:ok, city} = Primordia.Game.create_city(player.id, "Test City", 10, 10)
 
-        # Execute command
-        command_handler.handle(command)
+    # Start CityServer
+    {:ok, pid} = CityServer.start_link({city.id, player.id})
 
-        # Verify city was created
-        city = city_repository.find_by_coordinates(Coordinates(10, 10))
-        assert city is not None
-        assert city.name() == "Rome"
-        assert city.owner_id() == test_player.player_id()
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
 
-        # Verify settler was consumed
-        settler = unit_repository.find_by_id(test_settler.unit_id())
-        assert settler.is_consumed()
+    %{city: city, player: player, pid: pid}
+  end
 
-        # Verify event was published
-        events = event_bus.get_published_events()
-        assert any(
-            isinstance(e, CityFoundedEvent) and e.city_id == city.city_id()
-            for e in events
-        )
+  test "starts production and completes after duration", %{city: city} do
+    # Start production
+    assert {:ok, updated} = CityServer.start_production(city.id, "granary")
+    assert updated.production_item == "granary"
+
+    # Wait for completion (use shorter duration in test config)
+    assert_receive {:production_complete, %{building: "granary"}}, 5000
+
+    # Verify state
+    state = CityServer.get_state(city.id)
+    assert "granary" in state.buildings
+    assert state.production_item == nil
+  end
+end
+```
+
+### Channel Tests
+
+```elixir
+# test/primordia_web/channels/game_channel_test.exs
+defmodule PrimordiaWeb.GameChannelTest do
+  use PrimordiaWeb.ChannelCase
+
+  setup do
+    {:ok, user} = create_user()
+    {:ok, player} = Primordia.Game.create_player(user.id)
+    {:ok, _, socket} = subscribe_and_join(socket, "game:player:#{player.id}")
+
+    %{socket: socket, player: player}
+  end
+
+  test "found_city creates city and broadcasts", %{socket: socket, player: player} do
+    # Create settler first
+    {:ok, settler} = create_settler(player.id, 10, 10)
+
+    # Send found_city command
+    ref = push(socket, "found_city", %{"settler_id" => settler.id, "name" => "Rome"})
+
+    # Assert reply
+    assert_reply ref, :ok, %{city_id: city_id}
+
+    # Assert broadcast
+    assert_broadcast "city_founded", %{city: %{name: "Rome"}}
+  end
+end
 ```
 
 ---
 
 ## Common Patterns and Examples
 
-### Pattern: First-Come-First-Served Concurrency
+### Pattern: Scheduled Actions with Process.send_after
 
-**Problem:** Two players move units to the same tile. Who gets there first?
+```elixir
+defmodule Primordia.Game.Servers.UnitServer do
+  use GenServer
 
-**Solution:** Use database-level locks or optimistic concurrency control.
+  def handle_call({:move_to, dest_x, dest_y}, _from, state) do
+    path = calculate_path(state.unit, dest_x, dest_y)
+    travel_time_ms = calculate_travel_time(path, state.unit.speed)
 
-```python
-class CompleteUnitMovementCommandHandler:
-    def handle(self, command: CompleteUnitMovementCommand) -> None:
-        with self.__unit_of_work():
-            # Lock the destination tile
-            tile = self.__world_repository.find_tile_with_lock(
-                Coordinates(command.x, command.y)
-            )
+    # Schedule arrival
+    Process.send_after(self(), :arrive, travel_time_ms)
 
-            # Check if tile is already occupied
-            if tile.is_occupied_by_enemy(command.player_id):
-                # Initiate combat instead
-                self.__initiate_combat(command)
-                return
+    # Schedule intermediate position updates
+    schedule_position_updates(path, state.unit.speed)
 
-            # Complete movement
-            unit = self.__unit_repository.find_or_fail_by_id(command.unit_id)
-            unit.complete_movement()
-            tile.set_occupant(unit.unit_id())
+    updated_unit = %{state.unit |
+      destination_x: dest_x,
+      destination_y: dest_y,
+      arrival_time: DateTime.add(DateTime.utc_now(), travel_time_ms, :millisecond)
+    }
 
-            self.__unit_repository.save(unit)
-            self.__world_repository.save_tile(tile)
-            self.__event_bus.bulk_publish(unit.pull_events())
+    {:reply, {:ok, updated_unit}, %{state | unit: updated_unit}}
+  end
+
+  def handle_info({:position_update, {x, y}}, state) do
+    updated_unit = %{state.unit | x: x, y: y}
+    Events.unit_moved(state.player_id, updated_unit)
+    {:noreply, %{state | unit: updated_unit}}
+  end
+
+  def handle_info(:arrive, state) do
+    updated_unit = %{state.unit |
+      x: state.unit.destination_x,
+      y: state.unit.destination_y,
+      destination_x: nil,
+      destination_y: nil,
+      arrival_time: nil
+    }
+
+    # Check for combat
+    case check_for_enemies(updated_unit) do
+      nil -> :ok
+      enemy -> initiate_combat(updated_unit, enemy)
+    end
+
+    Events.unit_arrived(state.player_id, updated_unit)
+    {:noreply, %{state | unit: updated_unit}}
+  end
+
+  defp schedule_position_updates(path, speed) do
+    path
+    |> Enum.with_index()
+    |> Enum.each(fn {{x, y}, index} ->
+      delay = index * speed_to_ms_per_tile(speed)
+      Process.send_after(self(), {:position_update, {x, y}}, delay)
+    end)
+  end
+end
 ```
 
-### Pattern: Progressive Fog of War Revelation
+### Pattern: Global Tick Coordination
 
-**Problem:** As a unit moves, it should reveal tiles along its path.
+```elixir
+defmodule Primordia.Game.Servers.TickServer do
+  use GenServer
 
-**Solution:** Calculate visible tiles and update world state incrementally.
+  @tick_interval_ms 10_000
 
-```python
-# domain/services/fog_of_war_updater.py
-class FogOfWarUpdater:
-    """Domain service for calculating fog of war."""
+  def start_link(_) do
+    GenServer.start_link(__MODULE__, %{tick_count: 0}, name: __MODULE__)
+  end
 
-    def calculate_visible_tiles(
-        self,
-        coordinates: Coordinates,
-        vision_range: int
-    ) -> list[Coordinates]:
-        """
-        Returns list of tile coordinates visible from given position.
-        Uses circle algorithm for vision.
-        """
-        visible = []
-        for dx in range(-vision_range, vision_range + 1):
-            for dy in range(-vision_range, vision_range + 1):
-                if dx * dx + dy * dy <= vision_range * vision_range:
-                    visible.append(
-                        Coordinates(coordinates.x + dx, coordinates.y + dy)
-                    )
-        return visible
+  def init(state) do
+    schedule_tick()
+    {:ok, state}
+  end
 
+  def handle_info(:tick, state) do
+    tick_count = state.tick_count + 1
 
-# application/event_handlers/unit_moved_event_handler.py
-class UnitMovedEventHandler:
-    """Reveals fog of war when unit moves."""
+    # Notify all player servers
+    Registry.dispatch(Primordia.GameRegistry, :players, fn entries ->
+      for {pid, _} <- entries do
+        GenServer.cast(pid, {:process_tick, tick_count})
+      end
+    end)
 
-    def handle(self, event: UnitMovementStartedEvent) -> None:
-        """Updates fog of war along movement path."""
-        # Calculate tiles along path
-        path = self.__calculate_path(
-            from_coords=Coordinates(event.from_x, event.from_y),
-            to_coords=Coordinates(event.to_x, event.to_y)
-        )
+    # Broadcast global tick event
+    Phoenix.PubSub.broadcast(Primordia.PubSub, "game:global", {:tick, tick_count})
 
-        world = self.__world_repository.get_world()
+    schedule_tick()
+    {:noreply, %{state | tick_count: tick_count}}
+  end
 
-        for coords in path:
-            visible_tiles = self.__fog_updater.calculate_visible_tiles(
-                coordinates=coords,
-                vision_range=2  # Scout vision range
-            )
-
-            for tile_coords in visible_tiles:
-                world.reveal_tile_for_player(tile_coords, event.owner_id)
-
-        with self.__unit_of_work():
-            self.__world_repository.save(world)
+  defp schedule_tick do
+    Process.send_after(self(), :tick, @tick_interval_ms)
+  end
+end
 ```
 
-### Pattern: Production Queue Processing
+### Pattern: Fault Recovery
 
-**Problem:** Cities have production queues that complete over real-world time.
+```elixir
+defmodule Primordia.Game.Servers.PlayerServer do
+  use GenServer
+  require Logger
 
-**Solution:** Store completion timestamps and process them asynchronously.
+  @snapshot_interval_ms 30_000
 
-```python
-# domain/entities/city.py (excerpt)
-class City(AggregateRoot):
-    def start_production(self, item_type: str, duration_seconds: int) -> None:
-        """Adds item to production queue with calculated completion time."""
-        completion_time = datetime.utcnow() + timedelta(seconds=duration_seconds)
+  def init(player_id) do
+    # Load state from database
+    state = load_from_database(player_id)
 
-        item = ProductionItem(
-            item_type=item_type,
-            started_at=datetime.utcnow(),
-            completion_time=completion_time
-        )
+    # Re-schedule any pending timed actions
+    state = recover_scheduled_actions(state)
 
-        self.add_production_item(item)
+    # Schedule periodic snapshots
+    schedule_snapshot()
 
-        self.record(ProductionStartedEvent(
-            city_id=self.__city_id,
-            item_type=item_type,
-            completion_time=completion_time.isoformat()
-        ))
+    Logger.info("PlayerServer started for #{player_id}")
+    {:ok, state}
+  end
 
+  def handle_info(:snapshot, state) do
+    persist_state(state)
+    schedule_snapshot()
+    {:noreply, state}
+  end
 
-# application/schedulers/production_processor.py
-class ProductionProcessor:
-    """Checks for completed production every second."""
+  defp recover_scheduled_actions(state) do
+    now = DateTime.utc_now()
 
-    def process_completions(self) -> None:
-        """Completes production for all cities with finished items."""
-        now = datetime.utcnow()
+    # Recover city productions
+    Enum.each(state.cities, fn city ->
+      if city.production_completes_at do
+        remaining = DateTime.diff(city.production_completes_at, now, :millisecond)
+        if remaining > 0 do
+          Process.send_after(self(), {:complete_city_production, city.id}, remaining)
+        else
+          send(self(), {:complete_city_production, city.id})
+        end
+      end
+    end)
 
-        # Finder to get cities with completed production
-        cities_with_completions = self.__finder.find_cities_with_production_completing_before(now)
+    # Recover unit movements
+    Enum.each(state.units, fn unit ->
+      if unit.arrival_time do
+        remaining = DateTime.diff(unit.arrival_time, now, :millisecond)
+        if remaining > 0 do
+          Process.send_after(self(), {:unit_arrive, unit.id}, remaining)
+        else
+          send(self(), {:unit_arrive, unit.id})
+        end
+      end
+    end)
 
-        for city_view in cities_with_completions:
-            # Execute command to complete production
-            command = CompleteProductionCommand(
-                city_id=city_view.city_id,
-                item_type=city_view.current_production_item
-            )
-            self.__command_bus.dispatch(command)
+    state
+  end
+
+  defp schedule_snapshot do
+    Process.send_after(self(), :snapshot, @snapshot_interval_ms)
+  end
+end
+```
+
+### Pattern: Concurrency with GenServer Mailbox
+
+The Actor model naturally serializes concurrent requests:
+
+```elixir
+# Two players sending commands to the same city
+# are automatically serialized by GenServer mailbox
+
+# Player 1 sends "build granary"
+CityServer.start_production(city_id, "granary")
+
+# Player 2 sends "build barracks" at nearly the same time
+CityServer.start_production(city_id, "barracks")
+
+# The GenServer processes these one at a time in order received
+# No race conditions possible - this is the power of the Actor model
 ```
 
 ---
 
 ## Key Takeaways
 
-1. **Keep business logic in the domain** - Entities and domain services own the rules
-2. **Aggregate roots record events** - Use `aggregate.pull_events()` pattern
-3. **Application layer orchestrates** - Manages transactions, persistence, and event publishing
-4. **Separate commands from queries** - Use repositories for writes, finders for reads
-5. **Events are self-contained** - Include all context, not just IDs
-6. **Transactions in application layer only** - Never in domain or infrastructure
-7. **Use JSON-serializable primitives** - For all messages crossing boundaries
-8. **Preserve exception context** - Use `raise` and `raise ... from e`
-9. **Design for concurrency** - Use locks and optimistic concurrency control
-10. **Test at all layers** - Unit tests for domain, integration tests for flows
+1. **Functional core, imperative shell** - Pure domain logic, side effects in GenServers
+2. **Process-per-entity** - Each player/city/unit gets its own supervised process
+3. **Message serialization** - GenServer mailboxes eliminate race conditions naturally
+4. **Let it crash** - Use supervisors; don't over-handle errors
+5. **PubSub for events** - Decouple components with broadcast/subscribe
+6. **Ecto for persistence** - Keep schemas separate from domain structs
+7. **Test at all levels** - Unit tests for pure functions, integration for GenServers
+8. **Schedule with send_after** - No external job queue needed for delayed actions
+9. **Registry for lookup** - Dynamic process discovery without global state
+10. **Recover on restart** - Load state from DB, re-schedule pending actions
 
 ---
 
-## Next Steps
+## Getting Started
 
-1. **Set up project structure** following the code organization above
-2. **Implement core domain entities** (Player, City, Unit, Tile)
-3. **Define all domain events** in `domain/events/`
-4. **Implement command handlers** for core actions (found city, move unit)
-5. **Set up event bus** (start with in-memory, migrate to RabbitMQ)
-6. **Implement global tick scheduler** for resource generation
-7. **Build query side** with finders and view models
-8. **Add real-time updates** via WebSockets
-9. **Optimize with read models** (materialized views, Redis cache)
-10. **Scale with workers** (Celery for async processing)
+```bash
+# Create project
+mix phx.new primordia --database postgres
+
+# Set up database
+mix ecto.create
+mix ecto.migrate
+
+# Generate context
+mix phx.gen.context Game City cities name:string x:integer y:integer player_id:references:players
+
+# Run server
+iex -S mix phx.server
+
+# Open observer for process debugging
+:observer.start()
+```
 
 ---
 
-**Remember:** These patterns exist to help us build a maintainable, scalable system. Apply them pragmatically - start simple and add complexity only when needed. The goal is to deliver a working game that can evolve over time.
+**Remember:** Elixir and OTP give us powerful primitives for concurrent, fault-tolerant systems. The architecture should feel natural - processes that communicate via messages, supervisors that restart failed processes, and pure functions that make testing easy. Start simple and add complexity only when needed.
